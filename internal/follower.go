@@ -31,13 +31,14 @@ func NewFollower(leaderURL string) *Follower {
 	}
 }
 
-// Send proxies a tool call to the leader.
-func (f *Follower) Send(ctx context.Context, tool string, nodeIDs []string, params map[string]interface{}) (BridgeResponse, error) {
-	followerLogger.Printf("proxy %s nodeIDs=%v params=%v → %s/rpc", tool, nodeIDs, params, f.leaderURL)
+// Send proxies a tool call to the leader. file selects the target file (see RPCRequest).
+func (f *Follower) Send(ctx context.Context, file, tool string, nodeIDs []string, params map[string]interface{}) (BridgeResponse, error) {
+	followerLogger.Printf("proxy %s file=%q nodeIDs=%v → %s/rpc", tool, file, nodeIDs, f.leaderURL)
 	start := time.Now()
 
 	rpcReq := RPCRequest{
 		Tool:    tool,
+		File:    file,
 		NodeIDs: nodeIDs,
 		Params:  params,
 	}
@@ -80,6 +81,29 @@ func (f *Follower) Send(ctx context.Context, tool string, nodeIDs []string, para
 		Type: tool,
 		Data: rpcResp.Data,
 	}, nil
+}
+
+// Files asks the leader which files are connected.
+func (f *Follower) Files(ctx context.Context) ([]FileInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.leaderURL+"/files", nil)
+	if err != nil {
+		return nil, fmt.Errorf("new request: %w", err)
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("files call: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("the leader on %s is an older figma-mcp-go without multi-file support: restart it", f.leaderURL)
+	}
+	var body struct {
+		Files []FileInfo `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode files: %w", err)
+	}
+	return body.Files, nil
 }
 
 // Ping checks if the leader is alive. Returns true if healthy.

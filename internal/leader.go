@@ -20,7 +20,8 @@ var leaderLogger = log.New(os.Stderr, "[leader] ", 0)
 // Endpoints:
 //   /ws   — WebSocket upgrade for the Figma plugin
 //   /ping — Health check (GET)
-//   /rpc  — JSON RPC for follower tool calls (POST)
+//   /rpc  — JSON RPC for follower tool calls (POST); `file` picks the target file
+//   /files — The connected files (GET), one per plugin connection
 type Leader struct {
 	port    int
 	bridge  *Bridge
@@ -54,6 +55,7 @@ func (l *Leader) Start() error {
 	mux.HandleFunc("/ping", l.handlePing)
 	mux.HandleFunc("/rpc", l.handleRPC)
 	mux.HandleFunc("/ws", l.handleWS)
+	mux.HandleFunc("/files", l.handleFiles)
 
 	l.server = &http.Server{Handler: mux}
 
@@ -84,8 +86,21 @@ func (l *Leader) handlePing(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"version": l.version,
+		"status":   "ok",
+		"version":  l.version,
+		"features": "multi-file",
+	})
+}
+
+// handleFiles lists the connected files (refreshing their names first).
+func (l *Leader) handleFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"files": l.bridge.Files(r.Context(), true),
 	})
 }
 
@@ -113,7 +128,7 @@ func (l *Leader) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	leaderLogger.Printf("rpc %s nodeIDs=%v from %s", req.Tool, req.NodeIDs, r.RemoteAddr)
+	leaderLogger.Printf("rpc %s file=%q nodeIDs=%v from %s", req.Tool, req.File, req.NodeIDs, r.RemoteAddr)
 
 	if validationErr := ValidateRPC(req.Tool, req.NodeIDs, req.Params); validationErr != "" {
 		leaderLogger.Printf("rpc %s validation error: %s", req.Tool, validationErr)
@@ -121,7 +136,7 @@ func (l *Leader) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := l.bridge.Send(r.Context(), req.Tool, req.NodeIDs, req.Params)
+	resp, err := l.bridge.Send(r.Context(), req.File, req.Tool, req.NodeIDs, req.Params)
 	if err != nil {
 		leaderLogger.Printf("rpc %s bridge error: %v", req.Tool, err)
 		l.sendJSON(w, http.StatusOK, RPCResponse{Error: err.Error()})

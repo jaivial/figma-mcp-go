@@ -100,6 +100,28 @@ Watch the video:
 
 ---
 
+## Several files at once
+
+Run the plugin in as many Figma files (tabs) as you like: the leader keeps one connection per
+file instead of replacing the previous one, and names each connection by asking the plugin
+(`get_metadata`), so plugins of any version work.
+
+| Tool / argument | What it does |
+|---|---|
+| `list_files` | The connected files: connection id (`c1`, `c2`…), file name, current page, pending requests |
+| `select_file` | Pick this session's file (connection id, exact name, or a unique part of the name) |
+| `file` (every tool) | Override the target for one call |
+
+Without `file` and without a selection, a call goes to the only connected file; with several
+connected it fails and lists them, so an agent never writes into a file it did not choose.
+Each MCP process (one per agent session) keeps its own selection, so different agents can
+drive different files in parallel through the same leader.
+
+**Standalone leader.** `figma-mcp-go leader` owns the port and the plugin connections without
+being an MCP server; run it as a service and every MCP process becomes a follower of it, so
+connections survive agent sessions ending. `FIGMA_MCP_PORT` changes the port (default 1994; the
+plugin's `ui.html` and `manifest.json` must use the same one).
+
 ## Contributing
 
 Issues and PRs are welcome.

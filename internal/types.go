@@ -20,10 +20,25 @@ type BridgeResponse struct {
 }
 
 // RPCRequest is the wire format for follower → leader /rpc calls.
+//
+// File selects which connected Figma file handles the call: a connection id
+// ("c3"), an exact file name, or a unique substring of one. Empty means "the
+// only connected file" — with more than one connected it is an error, so a
+// caller never writes into a file it did not choose.
 type RPCRequest struct {
 	Tool    string                 `json:"tool"`
+	File    string                 `json:"file,omitempty"`
 	NodeIDs []string               `json:"nodeIds,omitempty"`
 	Params  map[string]interface{} `json:"params,omitempty"`
+}
+
+// FileInfo describes one plugin connection (one open Figma file running the plugin).
+type FileInfo struct {
+	ID          string `json:"id"`
+	FileName    string `json:"fileName"`
+	CurrentPage string `json:"currentPage,omitempty"`
+	ConnectedAt string `json:"connectedAt"`
+	Pending     int    `json:"pending"`
 }
 
 // RPCResponse is returned by the leader /rpc endpoint.
