@@ -356,6 +356,22 @@ const handleRequest = async (request) => {
         return { type: request.type, requestId: request.requestId, data: { count: matchingNodes.length, matchingNodes, searchedTypes: types } };
       }
 
+      case "execute_code": {
+        const code = request.params && request.params.code;
+        if (typeof code !== "string" || !code.trim()) throw new Error("code is required");
+        const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+        const run = new AsyncFunction("figma", code);
+        const result = await run(figma);
+        // Only JSON-safe data travels back (a node would not serialise).
+        let data;
+        try {
+          data = result === undefined ? null : JSON.parse(JSON.stringify(result));
+        } catch (e) {
+          data = String(result);
+        }
+        return { type: request.type, requestId: request.requestId, data: data };
+      }
+
       default:
         throw new Error(`Unknown request type: ${request.type}`);
     }

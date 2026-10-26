@@ -172,6 +172,27 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return executeSaveScreenshots(ctx, node, req)
 	})
+
+	// ── Write ────────────────────────────────────────────────────────────
+
+	s.AddTool(mcp.NewTool("execute_code",
+		mcp.WithDescription("Run JavaScript against the Figma Plugin API in the open file and return its result. "+
+			"The code is the body of an async function with `figma` in scope: use `await`, and `return` a JSON-serialisable value "+
+			"(node ids, names, counts — not nodes). This is the write tool: create/modify/delete nodes, components, variants, "+
+			"styles, prototype reactions. Load fonts before editing text (await figma.loadFontAsync(...)); "+
+			"use figma.getNodeByIdAsync and page.loadAsync(). Keep each call under ~25 s; split big jobs into several calls."),
+		mcp.WithString("code",
+			mcp.Required(),
+			mcp.Description("Async function body, e.g. `const n = figma.createRectangle(); n.resize(100, 40); return n.id;`"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		code, _ := req.Params.Arguments["code"].(string)
+		if strings.TrimSpace(code) == "" {
+			return mcp.NewToolResultError("code is required"), nil
+		}
+		resp, err := node.Send(ctx, "execute_code", nil, map[string]interface{}{"code": code})
+		return renderResponse(resp, err)
+	})
 }
 
 // RegisterPrompts registers MCP prompts on the server.
