@@ -53,6 +53,9 @@ func (f *Follower) Send(ctx context.Context, file, tool string, nodeIDs []string
 		return BridgeResponse{}, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if token := os.Getenv("FIGMA_MCP_TOKEN"); token != "" {
+		req.Header.Set("X-Figma-MCP-Token", token)
+	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {
