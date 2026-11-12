@@ -950,6 +950,26 @@ const handleRequest = async (request) => {
           data: await buildFromSpec(request.params || {}),
         };
 
+      case "export_code": {
+        const params = request.params || {};
+        const nodeId = (request.nodeIds && request.nodeIds[0]) || params.nodeId;
+        if (!nodeId) throw new Error("nodeId is required for export_code");
+        const flavor = params.flavor || "html-tailwind";
+        if (!EXPORT_FLAVORS.includes(flavor)) {
+          throw new Error(`Invalid flavor: ${flavor} (${EXPORT_FLAVORS.join("|")})`);
+        }
+        const classCase = params.classCase || "tailwind";
+        if (classCase !== "tailwind") throw new Error(`Invalid classCase: ${classCase} (tailwind)`);
+        const maxNodes =
+          typeof params.maxNodes === "number" && params.maxNodes > 0 ? Math.floor(params.maxNodes) : 2000;
+        const root = await figma.getNodeByIdAsync(nodeId);
+        if (!root || root.type === "DOCUMENT") throw new Error(`Node not found: ${nodeId}`);
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: buildExportCode(root, { flavor: flavor, maxNodes: maxNodes }),
+        };
+      }
       default:
         throw new Error(`Unknown request type: ${request.type}`);
     }
@@ -1872,3 +1892,5 @@ const buildFromSpec = async (params) => {
     bounds: toRect(root.absoluteBoundingBox),
   };
 };
+
+
