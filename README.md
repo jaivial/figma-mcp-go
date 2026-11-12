@@ -195,6 +195,24 @@ as a slimium session first:
 slimium attach --session figma-fork --port 9395
 ```
 
+## Fork browser stack (cu + slimium, no Playwright)
+
+The isolated fork browser is owned by a **second cu daemon** (`cu-fork`, HTTP :8795) so the usual
+cu MCP tools (`navigate/snapshot/click/eval`) can drive it too, while the plugin bridge uses the
+slimium CLI. Units: `cu-fork.service` + `figma-fork-slim-bridge.service` (enabled).
+
+- `cu-fork` — cu wrapper (`CU_DAEMON_DIR=~/.local/share/cu-fork`, CDP :9395) launching the browser
+  through `figma-fork-engine.sh`, which pins the **Figma-logged-in profile**, the UA figma.com
+  accepts, IPv4 DevTools and `--use-mock-keychain` (the profile's cookie crypto), and strips cu's
+  own `--user-data-dir/--user-agent/--password-store`.
+- Engine note: slimium's bundled engine (Chrome 156) breaks figma.com's desktop-bridge bootstrap
+  (`window.figma` is never set), so the engine binary is Chromium 1217 — the same build the
+  production figma browser runs. Only the binary is used; nothing runs Playwright.
+- The bridge holds the **session-scoped** CDP grant (`localNetworkAccess/localNetwork/loopbackNetwork`)
+  in a persistent `slimium batch` child — without it the page cannot reach ws://localhost NOR the
+  Figma desktop agent on 127.0.0.1:44950, and figma.com never exposes the plugin API object.
+- MCP entry for agents: `[mcp_servers.figma-cu] command = "/home/jaime/bin/cu-fork" args = ["mcp"]`.
+
 `scripts/dom2figma.mjs` is the **code → design** half of the migration bridge: it snapshots
 a page in the fork's CDP browser and rebuilds it in Figma through `build_from_spec`. The
 browser has already resolved every style, so what you get is what the user actually sees —
