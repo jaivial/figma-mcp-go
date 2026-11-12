@@ -183,6 +183,48 @@ should drive.
 `FIGMA_MCP_TOKEN` (optional) enables shared-secret authentication: when set, only clients
 presenting the same token are accepted.
 
+## Migrating a rendered web page into Figma
+
+`scripts/dom2figma.mjs` is the **code → design** half of the migration bridge: it snapshots
+a page in the fork's CDP browser and rebuilds it in Figma through `build_from_spec`. The
+browser has already resolved every style, so what you get is what the user actually sees —
+Tailwind arbitrary values, media queries, and `oklch()` colors included.
+
+What it maps:
+
+| In the page | In Figma |
+|---|---|
+| `display: flex` container | Auto-layout frame (`dir`, `gap`, `pad`, `align`) with fixed measured size |
+| Text-bearing leaf | Text node (`chars`, `size`, `weight` mapped 400/500/600/700+, `color`) |
+| Plain block container | Frame whose children keep their absolute page coordinates |
+| `<img>` (loaded) | Gray placeholder rectangle named `img:<alt or filename>` |
+| Inline `<svg>` (≥ 12px) | Ellipse stub named `icon:<aria-label or class>` |
+
+Example against the Neural dev server:
+
+```bash
+# inspect the generated spec first (children beyond 2 levels shown as counts)
+./scripts/dom2figma.mjs http://127.0.0.1:5173 --dry
+
+# rebuild the whole page, or just a section, into the connected Figma file
+./scripts/dom2figma.mjs http://127.0.0.1:5173 --sel "header" --name "Neural — Header" --position 0,0
+```
+
+It connects to the CDP browser (`--cdp`, default `http://127.0.0.1:9395`) in a new tab,
+grants `local-network-access`, waits for the page to settle (`--wait`), walks the DOM
+(`--max-nodes`/`--max-depth` caps, `--snap` optional grid), and POSTs to the leader
+(`--rpc`, default `http://127.0.0.1:1996`; `FIGMA_MCP_TOKEN` is honored). The tab it
+opened is closed afterwards.
+
+Fidelity limits: shadows, gradients, and blend modes fall back to the nearest solid fill;
+fonts fall back to the closest mapped weight; `<canvas>`, `<video>`, `<iframe>`, and
+SVG internals are skipped or stubbed; hover states and below-the-fold lazy content are
+not captured. In return you get live geometry — the exact rendered sizes, gaps, and
+colors — as a starting point to clean up by hand.
+
+The reverse direction is `export_code`: it turns a Figma selection back into Tailwind
+markup, so a page can round-trip DOM → Figma → code while you tune either side.
+
 ## Contributing
 
 Issues and PRs are welcome.
