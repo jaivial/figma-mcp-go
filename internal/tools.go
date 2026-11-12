@@ -413,6 +413,48 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		return ExecuteCaptureReview(ctx, node, req)
 	})
 
+	s.AddTool(mcp.NewTool("export_visual_review",
+		withFile(),
+		mcp.WithDescription("Export EVERY reviewable frame of EVERY page (or filtered pages) as ready-to-review images in ONE call: "+
+			"enumerates top-level frames (optional nested), exports each at a legibility-preserving auto scale (2x small components, 1x screens, "+
+			"downscale for oversized), tiles frames taller than tileMaxHeight (default 1600 design px, 64px overlap) so text stays readable after "+
+			"model downscaling, writes JPG/PNG under outputDir (relative, must not exist) with deterministic page/frame naming, and returns a "+
+			"manifest (paths + tile counts + review checklist). No base64 reaches your context. Review each image against the checklist, "+
+			"annotate issues with annotate_finding, fix, then re-run into a NEW directory and compare."),
+		mcp.WithString("outputDir",
+			mcp.Required(),
+			mcp.Description("Relative output directory for the review images; must not exist yet"),
+		),
+		mcp.WithArray("pages",
+			mcp.Description("Optional page names/ids to review; default: every page"),
+		),
+		mcp.WithString("filter",
+			mcp.Description("Optional case-insensitive regex on frame names"),
+		),
+		mcp.WithBoolean("includeNested",
+			mcp.Description("Also include nested frames one level deep (default: top-level screens only)"),
+		),
+		mcp.WithNumber("scale",
+			mcp.Description("Fixed export scale; default 0 = auto (2x <800px, 1x <=2400px, else fit 1600)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("JPG (default, jpegQuality 88) or PNG"),
+		),
+		mcp.WithNumber("tileMaxHeight",
+			mcp.Description("Max tile height in design px (default 1600; tall frames are sliced with overlap)"),
+		),
+		mcp.WithNumber("maxFrames",
+			mcp.Description("Safety cap, default 200"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		out, err := ExecuteVisualReview(ctx, node, req.Params.Arguments)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		b, _ := json.Marshal(out)
+		return mcp.NewToolResultText(string(b)), nil
+	})
+
 	// ── Layout writes ────────────────────────────────────────────────────
 
 	s.AddTool(mcp.NewTool("set_text",
@@ -785,7 +827,9 @@ func RegisterPrompts(s *server.MCPServer) {
 					mcp.NewTextContent(`Visual review protocol with figma-mcp-go:
 
 0. list_files then select_file so the review targets the right file
-1. capture_review(nodeId, .figma-shots/review-N.png) — one call writes the screenshot
+1. Whole file? export_visual_review(outputDir) first — every frame of every page as
+   ready-to-review tiled images (tall frames are sliced at 1600px with overlap so text
+   stays legible). Single frame? capture_review(nodeId, .figma-shots/review-N.png)
    to disk and returns the layout context, text inventory, and checklist
 2. Open the PNG and review EVERY checklist item, citing concrete nodes from the
    layout context and text inventory — never vague impressions
@@ -867,9 +911,9 @@ func toStringSlice(raw []interface{}) []string {
 // ── save_screenshots ─────────────────────────────────────────────────────────
 
 type saveItem struct {
-	NodeID     string `json:"nodeId"`
-	OutputPath string `json:"outputPath"`
-	Format     string `json:"format,omitempty"`
+	NodeID     string  `json:"nodeId"`
+	OutputPath string  `json:"outputPath"`
+	Format     string  `json:"format,omitempty"`
 	Scale      float64 `json:"scale,omitempty"`
 }
 

@@ -1106,6 +1106,41 @@ const handleRequest = async (request) => {
           data: { nodeId: node.id, annotations: node.annotations.length },
         };
       }
+      case "list_review_frames": {
+        const params = request.params || {};
+        const wantPages = Array.isArray(params.pages) ? params.pages.map(String) : null;
+        const filter = typeof params.filter === "string" && params.filter ? new RegExp(params.filter, "i") : null;
+        const includeNested = params.includeNested === true;
+        const out = [];
+        const pages = figma.root.children;
+        for (let pi = 0; pi < pages.length; pi++) {
+          const page = pages[pi];
+          const wanted = !wantPages || wantPages.some((w) => w === page.id || page.name.toLowerCase().includes(w.toLowerCase()));
+          if (!wanted) continue;
+          await page.loadAsync();
+          const frames = [];
+          const push = (n, depth) => {
+            if (frames.some((f) => f.id === n.id)) return;
+            if ("visible" in n && !n.visible) return;
+            if (n.type !== "FRAME" && n.type !== "COMPONENT" && n.type !== "INSTANCE" && n.type !== "SECTION") return;
+            const box = n.absoluteBoundingBox;
+            if (!box || box.width < 8 || box.height < 8) return;
+            if (filter && !filter.test(n.name)) return;
+            frames.push({ id: n.id, name: n.name, type: n.type, depth, x: round2(box.x), y: round2(box.y), width: round2(box.width), height: round2(box.height) });
+          };
+          for (const child of page.children) {
+            push(child, 0);
+            if (includeNested && "children" in child) {
+              for (const grandchild of child.children) push(grandchild, 1);
+            }
+          }
+          figma.ui.postMessage({ type: "progress_update", requestId: request.requestId, progress: Math.round(((pi + 1) / pages.length) * 90) + 5, message: page.name + ": " + frames.length + " frames" });
+          await new Promise((r) => setTimeout(r, 0));
+          if (frames.length > 0) out.push({ pageId: page.id, pageName: page.name, frames });
+        }
+        return { type: request.type, requestId: request.requestId, data: { pages: out } };
+      }
+
       default:
         throw new Error(`Unknown request type: ${request.type}`);
     }

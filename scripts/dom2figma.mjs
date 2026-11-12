@@ -340,7 +340,9 @@ const walkPage = ({ selector, maxNodes, maxDepth, snap }) => {
     if (cs.display === "flex" || cs.display === "inline-flex") {
       counts.nodes++;
       counts.auto++;
-      const spec = { type: "auto", dir: cs.flexDirection.startsWith("column") ? "v" : "h", name: nameOf(el), hug: false };
+      // No `hug` key: omitted = FIXED axes (measured w/h), which is what a
+      // fidelity migration wants. The grammar only accepts {w,h} booleans.
+      const spec = { type: "auto", dir: cs.flexDirection.startsWith("column") ? "v" : "h", name: nameOf(el) };
       const gap = px(cs.flexDirection.startsWith("column") ? cs.columnGap : cs.rowGap);
       if (gap > 0) spec.gap = rv(gap);
       const pad = padOf(cs);
