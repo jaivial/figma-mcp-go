@@ -679,9 +679,11 @@ const handleRequest = async (request) => {
             afterIndex = parent.children.findIndex((child) => child.id === afterNode.id);
             if (afterIndex === -1) throw new Error(`after node ${params.after} is not a child of ${parent.id}`);
           }
-          if (node.parent && node.parent.id !== parent.id) parent.appendChild(node);
+          const alreadyChild = node.parent && node.parent.id === parent.id;
+          if (!alreadyChild) parent.appendChild(node);
+          // Only reorder on an explicit `after`: a no-op position call inside an
+          // auto-layout parent must not silently move the child to the end.
           if (afterIndex >= 0) parent.insertChild(afterIndex + 1, node);
-          else parent.appendChild(node);
           let mode = "auto-layout";
           if (params.align) {
             const counterAxis = ALIGN_TO_COUNTER_AXIS[params.align];
