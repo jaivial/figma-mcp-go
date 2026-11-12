@@ -943,6 +943,143 @@ const handleRequest = async (request) => {
         };
       }
 
+      case "search_nodes": {
+        const params = request.params || {};
+        const query = params.query;
+        if (typeof query !== "string" || !query.trim()) throw new Error("query is required for search_nodes");
+        const typeFilter = typeof params.type === "string" && params.type ? params.type : null;
+        const limitParam = params.limit != null ? Number(params.limit) : 30;
+        if (!isFinite(limitParam) || limitParam <= 0) throw new Error("limit must be a positive number");
+        const limit = Math.floor(limitParam);
+        let root = figma.currentPage;
+        if (params.parentId) {
+          root = await figma.getNodeByIdAsync(params.parentId);
+          if (!root) throw new Error(`Parent not found: ${params.parentId}`);
+        }
+        const lowerQuery = query.toLowerCase();
+        const matches = [];
+        // Depth-first in child order; stops as soon as the limit is filled.
+        const collect = (n) => {
+          if (matches.length >= limit) return;
+          if (n.type !== "DOCUMENT" && n.name.toLowerCase().includes(lowerQuery) && (!typeFilter || n.type === typeFilter)) {
+            matches.push({
+              id: n.id,
+              name: n.name,
+              type: n.type,
+              x: "x" in n ? Math.round(n.x) : null,
+              y: "y" in n ? Math.round(n.y) : null,
+              width: "width" in n ? Math.round(n.width) : null,
+              height: "height" in n ? Math.round(n.height) : null,
+            });
+          }
+          if ("children" in n && n.children) for (const child of n.children) collect(child);
+        };
+        collect(root);
+        return { type: request.type, requestId: request.requestId, data: { count: matches.length, nodes: matches } };
+      }
+
+      case "apply_style": {
+        const params = request.params || {};
+        const styleType = params.styleType || "paint";
+        const binding = STYLE_BINDINGS[styleType];
+        if (!binding) throw new Error(`Invalid styleType: ${styleType} (${Object.keys(STYLE_BINDINGS).join("|")})`);
+        if (!params.styleName || typeof params.styleName !== "string") throw new Error("styleName is required for apply_style");
+        const styles = await binding.list();
+        const style = resolveNamed(styles, params.styleName, `${styleType} style`);
+        const nodes = await resolveNodes(requestNodeIds(request));
+        const results = [];
+        for (const node of nodes) {
+          const skipped = await bindStyleId(node, binding, styleType, style.id);
+          results.push(skipped ? { id: node.id, applied: false, skipped: skipped } : { id: node.id, applied: true });
+        }
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: { style: { id: style.id, name: style.name }, results: results },
+        };
+      }
+
+      case "apply_variable": {
+        const params = request.params || {};
+        const field = params.field || "color";
+        if (field !== "color") throw new Error(`Unsupported field: ${field} (only "color" is supported)`);
+        if (!params.variableName || typeof params.variableName !== "string") {
+          throw new Error("variableName is required for apply_variable");
+        }
+        const variable = await findVariableByName(params.variableName);
+        if (variable.resolvedType !== "COLOR") {
+          throw new Error(`Variable ${variable.name} is ${variable.resolvedType}, not COLOR`);
+        }
+        const nodes = await resolveNodes(requestNodeIds(request));
+        const results = [];
+        for (const node of nodes) {
+          if (!("fills" in node)) {
+            results.push({ id: node.id, applied: false, skipped: `node is ${node.type}, which has no fills` });
+            continue;
+          }
+          const first = !isMixed(node.fills) && Array.isArray(node.fills) && node.fills[0]
+            ? node.fills[0].type
+            : (isMixed(node.fills) ? "mixed" : "empty");
+          if (first !== "SOLID") {
+            results.push({ id: node.id, applied: false, skipped: `fills[0] is ${first}; variable binding needs a SOLID fill` });
+            continue;
+          }
+          try {
+            // The helper returns a bound copy of the paint; write it back into fills.
+            const bound = figma.variables.setBoundVariableForPaint(node.fills[0], "color", variable);
+            node.fills = [bound].concat(node.fills.slice(1));
+          } catch (error) {
+            throw new Error(
+              `Failed to bind variable ${variable.name} to fills[0] of ${node.id} (${node.type}): ${errorMessage(error)}. ` +
+                `Variable binding needs a SOLID paint in fills[0] and a runtime with setBoundVariableForPaint; ` +
+                `check the variable with get_variable_defs and the fill first.`
+            );
+          }
+          results.push({ id: node.id, applied: true });
+        }
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: { variable: { id: variable.id, name: variable.name }, results: results },
+        };
+      }
+
+      case "annotate_finding": {
+        const params = request.params || {};
+        const nodeId = params.nodeId || (request.nodeIds && request.nodeIds[0]);
+        if (!nodeId) throw new Error("nodeId is required for annotate_finding");
+        if (typeof params.message !== "string" || !params.message.trim()) {
+          throw new Error("message is required for annotate_finding");
+        }
+        const severity = params.severity || "minor";
+        if (!ANNOTATION_SEVERITIES.includes(severity)) {
+          throw new Error(`Invalid severity: ${severity} (${ANNOTATION_SEVERITIES.join("|")})`);
+        }
+        const node = await figma.getNodeByIdAsync(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        if (!("annotations" in node)) {
+          throw new Error(`Node ${node.id} is a ${node.type}, which does not support annotations`);
+        }
+        if (!figma.annotations || typeof figma.annotations.getAnnotationCategoriesAsync !== "function") {
+          throw new Error("Dev-mode annotations are not available in this Figma version");
+        }
+        const categories = await figma.annotations.getAnnotationCategoriesAsync();
+        let category = categories.find((c) => c.label.toLowerCase() === "qa");
+        if (!category) category = await figma.annotations.addAnnotationCategoryAsync({ label: "QA", color: "red" });
+        // Idempotent: replace this tool's previous QA note, keep every other annotation.
+        const existing = Array.isArray(node.annotations) ? node.annotations.slice() : [];
+        const kept = existing.filter(
+          (annotation) =>
+            !(annotation && typeof annotation.labelMarkdown === "string" && annotation.labelMarkdown.startsWith(QA_ANNOTATION_PREFIX))
+        );
+        node.annotations = kept.concat([{ categoryId: category.id, labelMarkdown: `**QA · ${severity}** — ${params.message}` }]);
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: { nodeId: node.id, annotations: node.annotations.length },
+        };
+      }
+
       default:
         throw new Error(`Unknown request type: ${request.type}`);
     }
@@ -1474,4 +1611,99 @@ const validateLayout = (root, grid, checks) => {
   };
   if (truncated) data.truncated = true;
   return data;
+};
+
+// ── Design-quality helpers ───────────────────────────────────────────────────
+
+const ANNOTATION_SEVERITIES = ["blocker", "major", "minor", "nit"];
+const QA_ANNOTATION_PREFIX = "**QA";
+
+// Style kind → where to list styles and how to bind one on a node. The async
+// setters are required under "documentAccess": "dynamic-page"; the plain id
+// properties are the legacy fallback for older runtimes.
+const STYLE_BINDINGS = {
+  paint: { list: () => figma.getLocalPaintStylesAsync(), property: "fillStyleId", setter: "setFillStyleIdAsync" },
+  text: { list: () => figma.getLocalTextStylesAsync(), property: "textStyleId", setter: "setTextStyleIdAsync" },
+  effect: { list: () => figma.getLocalEffectStylesAsync(), property: "effectStyleId", setter: "setEffectStyleIdAsync" },
+  grid: {
+    list: () => figma.getLocalGridStylesAsync(),
+    property: "gridStyleId",
+    legacyProperty: "layoutGridId",
+    setter: "setGridStyleIdAsync",
+  },
+};
+
+// Bind a style id on one node; returns null when applied, else a skip reason.
+const bindStyleId = async (node, binding, styleType, styleId) => {
+  const property = binding.property in node ? binding.property : binding.legacyProperty;
+  if (!property) return `node is ${node.type}, which cannot take a ${styleType} style`;
+  if (typeof node[binding.setter] === "function") {
+    try {
+      await node[binding.setter](styleId);
+    } catch (error) {
+      return `${node.type}: ${errorMessage(error)}`;
+    }
+    return null;
+  }
+  try {
+    node[property] = styleId;
+  } catch (error) {
+    return `${node.type}: ${errorMessage(error)}`;
+  }
+  return null;
+};
+
+// Edit distance for "did you mean" errors on style and variable names.
+const nameDistance = (a, b) => {
+  const aLower = a.toLowerCase();
+  const bLower = b.toLowerCase();
+  let previous = Array.from({ length: bLower.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= aLower.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= bLower.length; j++) {
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + (aLower[i - 1] === bLower[j - 1] ? 0 : 1)
+      );
+    }
+    previous = current;
+  }
+  return previous[bLower.length];
+};
+
+// The `count` names closest to `name`, for actionable missing-reference errors.
+const closestNames = (name, names, count = 5) =>
+  names
+    .map((candidate) => ({ candidate: candidate, distance: nameDistance(name, candidate) }))
+    .sort((a, b) => a.distance - b.distance || a.candidate.localeCompare(b.candidate))
+    .slice(0, count)
+    .map((entry) => entry.candidate);
+
+// Resolve a named reference (style or variable): case-insensitive exact name,
+// then unique prefix. Ambiguous names error listing every match; missing names
+// error with the 5 closest existing names so the caller can retry with a real one.
+const resolveNamed = (items, name, label, getName = (item) => item.name) => {
+  if (items.length === 0) throw new Error(`No ${label} exists in this file (searched for "${name}")`);
+  const lower = name.toLowerCase();
+  const exact = items.filter((item) => getName(item).toLowerCase() === lower);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) throw new Error(`Ambiguous ${label} "${name}": ${exact.map(getName).join(", ")}`);
+  const prefixed = items.filter((item) => getName(item).toLowerCase().startsWith(lower));
+  if (prefixed.length === 1) return prefixed[0];
+  if (prefixed.length > 1) throw new Error(`Ambiguous ${label} "${name}": ${prefixed.map(getName).join(", ")}`);
+  throw new Error(`${label} not found: "${name}". Closest: ${closestNames(name, items.map(getName)).join(", ")}`);
+};
+
+// Find a variable by name across every local collection (exact or unique prefix).
+const findVariableByName = async (variableName) => {
+  const collections = await figma.variables.getLocalVariableCollectionsAsync();
+  const variables = [];
+  for (const collection of collections) {
+    for (const id of collection.variableIds) {
+      const variable = await figma.variables.getVariableByIdAsync(id);
+      if (variable) variables.push(variable);
+    }
+  }
+  return resolveNamed(variables, variableName, "variable");
 };

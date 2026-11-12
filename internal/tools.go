@@ -200,6 +200,121 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		return renderResponse(resp, err)
 	})
 
+	s.AddTool(mcp.NewTool("search_nodes",
+		withFile(),
+		mcp.WithDescription("Find existing nodes by name BEFORE creating new ones — reuse beats rebuild. "+
+			"Case-insensitive substring match over the current page (or a parentId subtree), optional type filter "+
+			"(e.g. COMPONENT, FRAME, TEXT); returns id/name/type/geometry for up to `limit` (default 30) matches. "+
+			"If a suitable component or frame already exists, reuse or instance it instead of rebuilding from scratch."),
+		mcp.WithString("query",
+			mcp.Required(),
+			mcp.Description("Case-insensitive name substring to search for, e.g. 'Button/Primary'"),
+		),
+		mcp.WithString("type",
+			mcp.Description("Optional node type filter e.g. 'COMPONENT', 'FRAME', 'TEXT'"),
+		),
+		mcp.WithString("parentId",
+			mcp.Description("Optional subtree root node ID; default searches the whole current page"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum matches to return (default 30)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		query, _ := req.Params.Arguments["query"].(string)
+		if strings.TrimSpace(query) == "" {
+			return mcp.NewToolResultError("query is required"), nil
+		}
+		resp, err := node.Send(ctx, fileArg(req), "search_nodes", nil, paramsFrom(req, "query", "type", "parentId", "limit"))
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("apply_style",
+		withFile(),
+		mcp.WithDescription("Bind an existing named style to nodes instead of hardcoding values: paint styles → fills, "+
+			"text styles → TEXT nodes, effect styles, grid styles → frames. `styleName` resolves case-insensitively "+
+			"(exact name, then unique prefix); ambiguous names error listing the matches, unknown names error with the 5 "+
+			"closest names. Nodes that cannot take the style are skipped with a per-node reason; the rest get the style id "+
+			"bound, so later style edits propagate. Call get_styles first to see what exists."),
+		mcp.WithArray("nodeIds",
+			mcp.Required(),
+			mcp.Description("Node IDs to bind the style to, colon format e.g. ['4029:12345', '4029:67890']"),
+		),
+		mcp.WithString("styleType",
+			mcp.Enum("paint", "text", "effect", "grid"),
+			mcp.Description("Kind of style to bind (default paint)"),
+		),
+		mcp.WithString("styleName",
+			mcp.Required(),
+			mcp.Description("Style name, case-insensitive exact or unique prefix e.g. 'Primary/Button'"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		styleName, _ := req.Params.Arguments["styleName"].(string)
+		if strings.TrimSpace(styleName) == "" {
+			return mcp.NewToolResultError("styleName is required"), nil
+		}
+		raw, _ := req.Params.Arguments["nodeIds"].([]interface{})
+		resp, err := node.Send(ctx, fileArg(req), "apply_style", toStringSlice(raw), paramsFrom(req, "styleType", "styleName"))
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("apply_variable",
+		withFile(),
+		mcp.WithDescription("Bind a color variable (design token) to fills[0] of nodes instead of hardcoding hex values. "+
+			"`variableName` resolves across all local collections (exact name, then unique prefix; ambiguous or unknown names error). "+
+			"Needs a SOLID fill in fills[0] — unsuitable nodes are skipped with a per-node reason. Use get_variable_defs to list "+
+			"tokens, then prefer this over hand-written fills whenever a matching color token exists."),
+		mcp.WithArray("nodeIds",
+			mcp.Required(),
+			mcp.Description("Node IDs to bind the variable to, colon format e.g. ['4029:12345', '4029:67890']"),
+		),
+		mcp.WithString("variableName",
+			mcp.Required(),
+			mcp.Description("Color variable name, case-insensitive exact or unique prefix e.g. 'brand/primary'"),
+		),
+		mcp.WithString("field",
+			mcp.Enum("color"),
+			mcp.Description("Paint field to bind (only 'color' is supported for now)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		variableName, _ := req.Params.Arguments["variableName"].(string)
+		if strings.TrimSpace(variableName) == "" {
+			return mcp.NewToolResultError("variableName is required"), nil
+		}
+		raw, _ := req.Params.Arguments["nodeIds"].([]interface{})
+		resp, err := node.Send(ctx, fileArg(req), "apply_variable", toStringSlice(raw), paramsFrom(req, "variableName", "field"))
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("annotate_finding",
+		withFile(),
+		mcp.WithDescription("Attach a QA finding as a dev-mode annotation on the exact node, so humans see the problem in Dev Mode "+
+			"right where it lives. Severity blocker|major|minor|nit (default minor). Idempotent: re-annotating a node replaces this "+
+			"tool's previous '**QA' note on it and leaves every other annotation untouched; finds or creates a red 'QA' category."),
+		mcp.WithString("nodeId",
+			mcp.Required(),
+			mcp.Description("Node ID to annotate, colon format e.g. '4029:12345'"),
+		),
+		mcp.WithString("message",
+			mcp.Required(),
+			mcp.Description("Finding description in plain English, e.g. 'label off the 8px grid by 3px'"),
+		),
+		mcp.WithString("severity",
+			mcp.Enum("blocker", "major", "minor", "nit"),
+			mcp.Description("Severity of the finding (default minor)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeID, _ := req.Params.Arguments["nodeId"].(string)
+		if strings.TrimSpace(nodeID) == "" {
+			return mcp.NewToolResultError("nodeId is required"), nil
+		}
+		message, _ := req.Params.Arguments["message"].(string)
+		if strings.TrimSpace(message) == "" {
+			return mcp.NewToolResultError("message is required"), nil
+		}
+		resp, err := node.Send(ctx, fileArg(req), "annotate_finding", nil, paramsFrom(req, "nodeId", "message", "severity"))
+		return renderResponse(resp, err)
+	})
+
 	// ── Export ───────────────────────────────────────────────────────────
 
 	s.AddTool(mcp.NewTool("get_screenshot",
