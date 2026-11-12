@@ -427,6 +427,59 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		return renderResponse(resp, err)
 	})
 
+	// build_from_spec: the spec is a whole grammar tree (object OR array), which
+	// the typed schema helpers cannot express — so the property stays permissive
+	// (oneOf object|array) and the grammar is taught in the description instead.
+	buildSpecTool := mcp.NewTool("build_from_spec",
+		withFile(),
+		mcp.WithDescription("Build a whole section in ONE call from a JSON spec (nested auto-layout frames, texts, fills). "+
+			"Prefer this over repeated execute_code for new UI: ~10x fewer round-trips, auto-layout by default, 8px snapping. "+
+			"'auto' nodes map dir/gap/pad/align/hug to Figma auto-layout; fill accepts '#hex' or 'style:<name>' to bind existing paint styles. "+
+			"Grammar — auto node: {type:'auto', dir:'h'|'v', gap?, pad?: 16|{t,r,b,l}, align?: {main?: 'start'|'center'|'end'|'space-between', counter?: 'start'|'center'|'end'}, hug?: {w?, h?}}; "+
+			"other nodes: {type:'frame'|'text'|'rectangle'|'ellipse'}; common keys: name?, w?, h?, x?, y? (parent-local; ignored under auto layout with a warning), "+
+			"fill?, radius?, stroke? ('#hex'), strokeWeight?, opacity?, children? (not for text). "+
+			"text adds text:{chars (required), size?, weight?: 'regular'|'medium'|'semibold'|'bold' (Inter, default regular), align?: 'left'|'center'|'right', color?, lineHeight?}. "+
+			"Unknown keys become warnings, not errors; an auto axis without an explicit size hugs its content. "+
+			"spec = one node or an array (array → wrapped in a hugging horizontal auto frame). "+
+			"Example: {type:'auto', dir:'v', gap:8, pad:16, children:[{type:'text', name:'Label', text:{chars:'Total', size:12, weight:'medium'}}, "+
+			"{type:'text', name:'Value', text:{chars:'$42', size:24, weight:'bold'}}]}"),
+		mcp.WithString("parentId",
+			mcp.Description("Optional parent node ID, colon format; default places the tree on the current page"),
+		),
+		mcp.WithObject("position",
+			mcp.Properties(map[string]interface{}{
+				"x": map[string]interface{}{"type": "number", "description": "Absolute page x"},
+				"y": map[string]interface{}{"type": "number", "description": "Absolute page y"},
+			}),
+			mcp.Description("Absolute page coordinates {x, y} of the root (default {0, 0}); converted to parent-local and snapped"),
+		),
+		mcp.WithString("name",
+			mcp.Description("Root node name; overrides the spec root's own name"),
+		),
+		mcp.WithNumber("snap",
+			mcp.Description("Snap grid in px for the root position (default 8; <= 0 disables snapping)"),
+		),
+		mcp.WithNumber("maxNodes",
+			mcp.Description("Cap on total nodes created (default 500); the call fails without creating anything when exceeded"),
+		),
+	)
+	buildSpecTool.InputSchema.Properties["spec"] = map[string]interface{}{
+		"description": "Declarative node tree: a single node object or an array of nodes (grammar in the tool description)",
+		"oneOf": []interface{}{
+			map[string]interface{}{"type": "object"},
+			map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+		},
+	}
+	buildSpecTool.InputSchema.Required = append(buildSpecTool.InputSchema.Required, "spec")
+	s.AddTool(buildSpecTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		params := paramsFrom(req, "spec", "parentId", "position", "name", "snap", "maxNodes")
+		if params["spec"] == nil {
+			return mcp.NewToolResultError("spec is required"), nil
+		}
+		resp, err := node.Send(ctx, fileArg(req), "build_from_spec", nil, params)
+		return renderResponse(resp, err)
+	})
+
 	// ── Write ────────────────────────────────────────────────────────────
 
 	s.AddTool(mcp.NewTool("execute_code",

@@ -943,6 +943,13 @@ const handleRequest = async (request) => {
         };
       }
 
+      case "build_from_spec":
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: await buildFromSpec(request.params || {}),
+        };
+
       default:
         throw new Error(`Unknown request type: ${request.type}`);
     }
@@ -1474,4 +1481,394 @@ const validateLayout = (root, grid, checks) => {
   };
   if (truncated) data.truncated = true;
   return data;
+};
+
+// ── build_from_spec helpers ──────────────────────────────────────────────────
+
+// Keys the build_from_spec grammar understands, per node type. Common keys apply
+// to every node; "auto" adds layout keys and "text" adds the text block.
+const SPEC_COMMON_KEYS = ["type", "name", "w", "h", "x", "y", "fill", "radius", "stroke", "strokeWeight", "opacity", "children"];
+const SPEC_AUTO_KEYS = SPEC_COMMON_KEYS.concat(["dir", "gap", "pad", "align", "hug"]);
+const SPEC_TEXT_KEYS = SPEC_COMMON_KEYS.concat(["text"]);
+const SPEC_TEXT_BLOCK_KEYS = ["chars", "size", "weight", "align", "color", "lineHeight"];
+const SPEC_NODE_TYPES = ["auto", "frame", "text", "rectangle", "ellipse"];
+const SPEC_FONT_STYLES = { regular: "Regular", medium: "Medium", semibold: "Semi Bold", bold: "Bold" };
+const SPEC_MAIN_ALIGN = { start: "MIN", center: "CENTER", end: "MAX", "space-between": "SPACE_BETWEEN" };
+const SPEC_COUNTER_ALIGN = { start: "MIN", center: "CENTER", end: "MAX" };
+const SPEC_TEXT_ALIGN = { left: "LEFT", center: "CENTER", right: "RIGHT" };
+// Neutral grey used when a "style:<name>" lookup misses, so the build still lands.
+const SPEC_FALLBACK_FILL = "#d9d9d9";
+
+// Validate an optional numeric spec field; undefined when absent.
+const specNumber = (value, label, path, min) => {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !isFinite(value)) throw new Error(`${label} must be a finite number at ${path}`);
+  if (min !== undefined && value < min) throw new Error(`${label} must be >= ${min} at ${path}`);
+  return value;
+};
+
+// "#rgb", "#rgba", "#rrggbb" or "#rrggbbaa" → {color:{r,g,b}, opacity}; null when invalid.
+const parseSpecColor = (value) => {
+  const match = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(String(value).trim());
+  if (!match) return null;
+  let hex = match[1];
+  if (hex.length === 3 || hex.length === 4) hex = hex.split("").map((c) => c + c).join("");
+  return {
+    color: {
+      r: parseInt(hex.slice(0, 2), 16) / 255,
+      g: parseInt(hex.slice(2, 4), 16) / 255,
+      b: parseInt(hex.slice(4, 6), 16) / 255,
+    },
+    opacity: hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1,
+  };
+};
+
+const specSolid = (value) => Object.assign({ type: "SOLID" }, parseSpecColor(value));
+
+// A paint value must be a hex string or a paint-style reference.
+const auditSpecPaintValue = (value, label, path) => {
+  if (typeof value !== "string") throw new Error(`${label} must be a "#hex" color or "style:<name>" at ${path}`);
+  if (value.toLowerCase().startsWith("style:")) {
+    if (!value.slice(6).trim()) throw new Error(`${label} style name is empty at ${path}`);
+    return;
+  }
+  if (!parseSpecColor(value)) throw new Error(`${label} is not a valid hex color ("#rgb" or "#rrggbb"): ${value} at ${path}`);
+};
+
+const specUnknownKeys = (spec, allowedKeys, path, warnings) => {
+  for (const key of Object.keys(spec)) {
+    if (!allowedKeys.includes(key)) {
+      const named = typeof spec.name === "string" && spec.name ? ` (${spec.name})` : "";
+      warnings.push(`unknown key "${key}" at ${path}${named}`);
+    }
+  }
+};
+
+const auditSpecPad = (pad, path, warnings) => {
+  if (pad === undefined) return;
+  const badShape = () => new Error(`pad must be a non-negative number or {t, r, b, l} at ${path}`);
+  if (typeof pad === "number") {
+    if (!isFinite(pad) || pad < 0) throw badShape();
+    return;
+  }
+  if (!pad || typeof pad !== "object" || Array.isArray(pad)) throw badShape();
+  for (const key of Object.keys(pad)) {
+    if (!["t", "r", "b", "l"].includes(key)) warnings.push(`unknown key "${key}" at ${path}/pad`);
+  }
+  for (const key of ["t", "r", "b", "l"]) {
+    if (pad[key] !== undefined && (typeof pad[key] !== "number" || !isFinite(pad[key]) || pad[key] < 0)) {
+      throw new Error(`pad.${key} must be a non-negative number at ${path}`);
+    }
+  }
+};
+
+const auditSpecAlign = (align, path, warnings) => {
+  if (align === undefined) return;
+  if (!align || typeof align !== "object" || Array.isArray(align)) throw new Error(`align must be {main, counter} at ${path}`);
+  for (const key of Object.keys(align)) {
+    if (key !== "main" && key !== "counter") warnings.push(`unknown key "${key}" at ${path}/align`);
+  }
+  if (align.main !== undefined && !SPEC_MAIN_ALIGN[align.main]) {
+    throw new Error(`align.main must be "start"|"center"|"end"|"space-between" at ${path}`);
+  }
+  if (align.counter !== undefined && !SPEC_COUNTER_ALIGN[align.counter]) {
+    throw new Error(`align.counter must be "start"|"center"|"end" at ${path}`);
+  }
+};
+
+const auditSpecHug = (hug, path, warnings) => {
+  if (hug === undefined) return;
+  if (!hug || typeof hug !== "object" || Array.isArray(hug)) throw new Error(`hug must be {w, h} booleans at ${path}`);
+  for (const key of Object.keys(hug)) {
+    if (key !== "w" && key !== "h") warnings.push(`unknown key "${key}" at ${path}/hug`);
+  }
+  for (const key of ["w", "h"]) {
+    if (hug[key] !== undefined && typeof hug[key] !== "boolean") throw new Error(`hug.${key} must be a boolean at ${path}`);
+  }
+};
+
+// Walk the spec BEFORE building anything: validate shapes, count nodes and
+// collect the Inter weights + warnings, so a bad spec never leaves a half-built
+// tree behind. Unknown keys only warn — the node still builds.
+const auditSpecNode = (spec, path, audit) => {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+    throw new Error(`spec node at ${path} must be an object`);
+  }
+  if (!SPEC_NODE_TYPES.includes(spec.type)) {
+    throw new Error(`unknown node type ${JSON.stringify(spec.type)} at ${path} (valid: ${SPEC_NODE_TYPES.join(", ")})`);
+  }
+  const allowedKeys = spec.type === "auto" ? SPEC_AUTO_KEYS : spec.type === "text" ? SPEC_TEXT_KEYS : SPEC_COMMON_KEYS;
+  specUnknownKeys(spec, allowedKeys, path, audit.warnings);
+  if (spec.name !== undefined && typeof spec.name !== "string") throw new Error(`name must be a string at ${path}`);
+  specNumber(spec.w, "w", path, 0);
+  specNumber(spec.h, "h", path, 0);
+  specNumber(spec.x, "x", path);
+  specNumber(spec.y, "y", path);
+  if (spec.opacity !== undefined) {
+    if (typeof spec.opacity !== "number" || !isFinite(spec.opacity) || spec.opacity < 0 || spec.opacity > 1) {
+      throw new Error(`opacity must be a number between 0 and 1 at ${path}`);
+    }
+  }
+  if (spec.fill !== undefined) auditSpecPaintValue(spec.fill, "fill", path);
+  if (spec.stroke !== undefined) auditSpecPaintValue(spec.stroke, "stroke", path);
+  specNumber(spec.strokeWeight, "strokeWeight", path, 0);
+  specNumber(spec.radius, "radius", path, 0);
+  if (spec.type === "ellipse" && spec.radius !== undefined) {
+    audit.warnings.push(`radius is not supported on ellipse nodes: ignored at ${path}`);
+  }
+  if (spec.type === "auto") {
+    if (spec.dir !== "h" && spec.dir !== "v") throw new Error(`dir is required on auto nodes ("h"|"v") at ${path}`);
+    specNumber(spec.gap, "gap", path, 0);
+    auditSpecPad(spec.pad, path, audit.warnings);
+    auditSpecAlign(spec.align, path, audit.warnings);
+    auditSpecHug(spec.hug, path, audit.warnings);
+  }
+  if (spec.type === "text") {
+    if (!spec.text || typeof spec.text !== "object") {
+      throw new Error(`text is required on text nodes ({chars, size, weight, align, color, lineHeight}) at ${path}`);
+    }
+    specUnknownKeys(spec.text, SPEC_TEXT_BLOCK_KEYS, `${path}/text`, audit.warnings);
+    if (typeof spec.text.chars !== "string" || spec.text.chars.length === 0) {
+      throw new Error(`text.chars is required at ${path}`);
+    }
+    specNumber(spec.text.size, "text.size", path, 0);
+    specNumber(spec.text.lineHeight, "text.lineHeight", path, 0);
+    const weight = spec.text.weight === undefined ? "regular" : spec.text.weight;
+    if (!SPEC_FONT_STYLES[weight]) {
+      throw new Error(`text.weight must be one of ${Object.keys(SPEC_FONT_STYLES).join(", ")} at ${path}`);
+    }
+    if (spec.text.align !== undefined && !SPEC_TEXT_ALIGN[spec.text.align]) {
+      throw new Error(`text.align must be "left"|"center"|"right" at ${path}`);
+    }
+    if (spec.text.color !== undefined && !parseSpecColor(spec.text.color)) {
+      throw new Error(`text.color is not a valid hex color: ${spec.text.color} at ${path}`);
+    }
+    audit.fonts.add(weight);
+    if (spec.h !== undefined && spec.w === undefined) {
+      audit.warnings.push(`h without w is ignored on text nodes (height follows the font) at ${path}`);
+    }
+    if (spec.children !== undefined) {
+      audit.warnings.push(`children are not supported on text nodes: ignored at ${path}`);
+    }
+    audit.count++;
+    return;
+  }
+  if (spec.children !== undefined) {
+    if (!Array.isArray(spec.children)) throw new Error(`children must be an array at ${path}`);
+    for (let i = 0; i < spec.children.length; i++) {
+      auditSpecNode(spec.children[i], `${path}/children[${i}]`, audit);
+    }
+  }
+  audit.count++;
+};
+
+// Case-insensitive paint-style lookup by unique prefix: null when missing, an
+// error listing the candidates when the prefix is ambiguous.
+const findSpecPaintStyle = async (name, ctx) => {
+  if (!ctx.paintStyles) ctx.paintStyles = await figma.getLocalPaintStylesAsync();
+  const wanted = name.trim().toLowerCase();
+  const matches = ctx.paintStyles.filter((style) => style.name.toLowerCase().startsWith(wanted));
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) return null;
+  throw new Error(
+    `paint style "${name}" is ambiguous (${matches.length} matches): ${matches.map((s) => `${s.name}`).join(", ")}`
+  );
+};
+
+// Resolve the fill/stroke spec values onto a node: hex → SOLID paint,
+// "style:<name>" → fillStyleId/strokeStyleId binding (grey + warning when the
+// style does not exist).
+const applySpecPaint = async (node, spec, path, ctx) => {
+  const targets = [
+    { value: spec.fill, paintProp: "fills", styleProp: "fillStyleId", label: "fill" },
+    { value: spec.stroke, paintProp: "strokes", styleProp: "strokeStyleId", label: "stroke" },
+  ];
+  for (const target of targets) {
+    if (typeof target.value !== "string") continue;
+    if (!(target.paintProp in node)) {
+      ctx.warnings.push(`${target.label} is not supported on ${spec.type} nodes: ignored at ${path}`);
+      continue;
+    }
+    if (!target.value.toLowerCase().startsWith("style:")) {
+      node[target.paintProp] = [specSolid(target.value)];
+      continue;
+    }
+    const styleName = target.value.slice(6).trim();
+    const style = await findSpecPaintStyle(styleName, ctx);
+    if (style && target.styleProp in node) {
+      node[target.styleProp] = style.id;
+    } else if (style) {
+      node[target.paintProp] = style.paints;
+    } else {
+      node[target.paintProp] = [specSolid(SPEC_FALLBACK_FILL)];
+      ctx.warnings.push(`paint style "${styleName}" not found at ${path}: fell back to plain ${SPEC_FALLBACK_FILL}`);
+    }
+  }
+};
+
+const applySpecPadToFrame = (frame, pad) => {
+  if (pad === undefined) return;
+  if (typeof pad === "number") {
+    frame.paddingTop = pad;
+    frame.paddingRight = pad;
+    frame.paddingBottom = pad;
+    frame.paddingLeft = pad;
+    return;
+  }
+  frame.paddingTop = pad.t !== undefined ? pad.t : 0;
+  frame.paddingRight = pad.r !== undefined ? pad.r : 0;
+  frame.paddingBottom = pad.b !== undefined ? pad.b : 0;
+  frame.paddingLeft = pad.l !== undefined ? pad.l : 0;
+};
+
+// Create one node (and its subtree) from an audited spec.
+const buildSpecNode = async (spec, path, ctx) => {
+  let node;
+  if (spec.type === "auto" || spec.type === "frame") {
+    node = figma.createFrame();
+    ctx.created.frames++;
+    // Layout containers start transparent; a background is opt-in via fill.
+    node.fills = [];
+    if (spec.type === "auto") {
+      // Size while auto-layout is still off (resize is free then), enable the
+      // stack, and set hug/fixed per axis: an axis without an explicit size or
+      // hug=false hugs its content; a FIXED axis keeps the explicit w/h.
+      if (spec.w !== undefined || spec.h !== undefined) {
+        node.resize(spec.w !== undefined ? Math.max(spec.w, 0.01) : node.width, spec.h !== undefined ? Math.max(spec.h, 0.01) : node.height);
+      }
+      node.layoutMode = spec.dir === "v" ? "VERTICAL" : "HORIZONTAL";
+      if (spec.gap !== undefined) node.itemSpacing = spec.gap;
+      applySpecPadToFrame(node, spec.pad);
+      if (spec.align) {
+        if (spec.align.main) node.primaryAxisAlignItems = SPEC_MAIN_ALIGN[spec.align.main];
+        if (spec.align.counter) node.counterAxisAlignItems = SPEC_COUNTER_ALIGN[spec.align.counter];
+      }
+      const horizontal = spec.dir !== "v";
+      const hugW = (spec.hug && spec.hug.w === true) || spec.w === undefined;
+      const hugH = (spec.hug && spec.hug.h === true) || spec.h === undefined;
+      node.primaryAxisSizingMode = (horizontal ? hugW : hugH) ? "AUTO" : "FIXED";
+      node.counterAxisSizingMode = (horizontal ? hugH : hugW) ? "AUTO" : "FIXED";
+    } else if (spec.w !== undefined || spec.h !== undefined) {
+      node.resize(spec.w !== undefined ? Math.max(spec.w, 0.01) : node.width, spec.h !== undefined ? Math.max(spec.h, 0.01) : node.height);
+    }
+  } else if (spec.type === "text") {
+    node = figma.createText();
+    ctx.created.texts++;
+    const text = spec.text;
+    const weight = text.weight === undefined ? "regular" : text.weight;
+    // Font before characters (every weight was preloaded by buildFromSpec).
+    node.fontName = { family: "Inter", style: SPEC_FONT_STYLES[weight] };
+    if (text.size !== undefined) node.fontSize = text.size;
+    if (text.lineHeight !== undefined) node.lineHeight = { unit: "PIXELS", value: text.lineHeight };
+    if (text.align) node.textAlignHorizontal = SPEC_TEXT_ALIGN[text.align];
+    node.characters = text.chars;
+    if (spec.w !== undefined) {
+      // Fix the width first (HEIGHT reflows it), read the natural height, then
+      // pin both with NONE.
+      node.textAutoResize = "HEIGHT";
+      node.resize(Math.max(spec.w, 0.01), node.height);
+      const naturalHeight = node.height;
+      node.textAutoResize = "NONE";
+      node.resize(Math.max(spec.w, 0.01), Math.max(spec.h !== undefined ? spec.h : naturalHeight, 0.01));
+    } else {
+      node.textAutoResize = "HEIGHT";
+    }
+  } else {
+    node = spec.type === "ellipse" ? figma.createEllipse() : figma.createRectangle();
+    ctx.created.vectors++;
+    if (spec.w !== undefined || spec.h !== undefined) {
+      node.resize(spec.w !== undefined ? Math.max(spec.w, 0.01) : node.width, spec.h !== undefined ? Math.max(spec.h, 0.01) : node.height);
+    }
+  }
+  if (typeof spec.name === "string" && spec.name.length > 0) node.name = spec.name;
+  if (spec.radius !== undefined && "cornerRadius" in node) node.cornerRadius = spec.radius;
+  await applySpecPaint(node, spec, path, ctx);
+  // The text block's color is more specific than a common fill: apply it last.
+  if (spec.type === "text" && spec.text.color !== undefined) node.fills = [specSolid(spec.text.color)];
+  if (spec.opacity !== undefined) node.opacity = spec.opacity;
+  if (spec.strokeWeight !== undefined && "strokeWeight" in node) node.strokeWeight = spec.strokeWeight;
+  if (Array.isArray(spec.children) && "appendChild" in node) {
+    const autoParent = node.layoutMode && node.layoutMode !== "NONE";
+    for (let i = 0; i < spec.children.length; i++) {
+      const childSpec = spec.children[i];
+      const child = await buildSpecNode(childSpec, `${path}/children[${i}]`, ctx);
+      node.appendChild(child);
+      // x/y are parent-local and only meaningful under a non-auto parent;
+      // Figma silently ignores them inside auto layout, so warn instead.
+      if (!autoParent) {
+        if (childSpec.x !== undefined) child.x = childSpec.x;
+        if (childSpec.y !== undefined) child.y = childSpec.y;
+      } else if (childSpec.x !== undefined || childSpec.y !== undefined) {
+        ctx.warnings.push(`x/y ignored inside auto-layout parent at ${path}/children[${i}]`);
+      }
+    }
+  }
+  return node;
+};
+
+// build_from_spec entry point: audit → preload fonts → build → place the root.
+const buildFromSpec = async (params) => {
+  if (params.spec === undefined || params.spec === null) throw new Error("spec is required for build_from_spec");
+  if (Array.isArray(params.spec) && params.spec.length === 0) throw new Error("spec must not be an empty array");
+  // An array is a forest of siblings: wrap it in one hugging horizontal stack
+  // so the call still returns a single root.
+  const rootSpec = Array.isArray(params.spec)
+    ? Object.assign({ type: "auto", dir: "h", gap: 8, hug: { w: true, h: true }, children: params.spec },
+        typeof params.name === "string" ? { name: params.name } : {})
+    : params.spec;
+  const maxNodes = params.maxNodes === undefined ? 500 : params.maxNodes;
+  if (typeof maxNodes !== "number" || !isFinite(maxNodes) || maxNodes < 1) {
+    throw new Error("maxNodes must be a positive number");
+  }
+  if (params.snap !== undefined && (typeof params.snap !== "number" || !isFinite(params.snap))) {
+    throw new Error("snap must be a number (<= 0 disables snapping)");
+  }
+  const ctx = {
+    snap: params.snap === undefined ? 8 : params.snap,
+    warnings: [],
+    created: { frames: 0, texts: 0, vectors: 0 },
+    paintStyles: null,
+  };
+  const audit = { count: 0, fonts: new Set(), warnings: ctx.warnings };
+  auditSpecNode(rootSpec, "spec", audit);
+  if (audit.count > maxNodes) {
+    throw new Error(`spec needs ${audit.count} nodes but maxNodes is ${maxNodes}: nothing was created`);
+  }
+  await Promise.all(
+    Array.from(audit.fonts).map(async (weight) => {
+      const style = SPEC_FONT_STYLES[weight];
+      try {
+        await figma.loadFontAsync({ family: "Inter", style: style });
+      } catch (error) {
+        throw new Error(
+          `cannot load Inter ${style} (text.weight "${weight}") — enable the Inter font in this file or use another weight: ${errorMessage(error)}`
+        );
+      }
+    })
+  );
+  const parent = params.parentId ? await figma.getNodeByIdAsync(params.parentId) : figma.currentPage;
+  if (!parent || parent.type === "DOCUMENT") throw new Error(`Parent not found: ${params.parentId || "(current page)"}`);
+  if (!("appendChild" in parent)) throw new Error(`Parent ${parent.id} (${parent.type}) cannot have children`);
+  const parentInstanceError = instanceChainError(parent, true);
+  if (parentInstanceError) throw parentInstanceError;
+  const root = await buildSpecNode(rootSpec, "spec", ctx);
+  parent.appendChild(root);
+  if (typeof params.name === "string" && params.name.length > 0) root.name = params.name;
+  if (parent.layoutMode && parent.layoutMode !== "NONE") {
+    ctx.warnings.push("parentId runs auto-layout: position ignored, the tree was appended at the end of the stack");
+  } else {
+    // position is in absolute page coordinates; default origin is (0, 0).
+    const position = params.position && typeof params.position === "object" ? params.position : { x: 0, y: 0 };
+    const local = absToParentLocal(parent, Number(position.x), Number(position.y));
+    if (!isFinite(local.x) || !isFinite(local.y)) throw new Error("position must be finite {x, y} numbers");
+    root.x = snapValue(local.x, ctx.snap);
+    root.y = snapValue(local.y, ctx.snap);
+  }
+  return {
+    rootId: root.id,
+    name: root.name,
+    created: ctx.created,
+    warnings: ctx.warnings,
+    bounds: toRect(root.absoluteBoundingBox),
+  };
 };
