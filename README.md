@@ -187,6 +187,14 @@ presenting the same token are accepted.
 
 ## Migrating a rendered web page into Figma
 
+The migration bridge drives the browser **exclusively through the [slimium](https://github.com/) CLI**
+(`slimium open/eval/close` — no Playwright, no direct CDP client). The fork browser must be attached
+as a slimium session first:
+
+```bash
+slimium attach --session figma-fork --port 9395
+```
+
 `scripts/dom2figma.mjs` is the **code → design** half of the migration bridge: it snapshots
 a page in the fork's CDP browser and rebuilds it in Figma through `build_from_spec`. The
 browser has already resolved every style, so what you get is what the user actually sees —

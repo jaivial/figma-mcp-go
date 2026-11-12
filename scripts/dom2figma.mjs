@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 // DOM → Figma migration bridge (the code → design half).
 //
-// Connects to the fork's CDP browser, opens a fresh tab, waits until the page
-// is rendered (CSS/Tailwind resolved by the browser itself), walks the DOM and
-// emits a build_from_spec spec. With --dry the spec is printed; otherwise it
-// is POSTed to the leader /rpc endpoint. The reverse direction is export_code.
+// Drives the fork browser EXCLUSIVELY through the slimium CLI (no playwright,
+// no direct CDP client): opens a fresh tab, waits until the page is rendered
+// (CSS/Tailwind resolved by the browser itself), walks the DOM and emits a
+// build_from_spec spec. With --dry the spec is printed; otherwise it is POSTed
+// to the leader /rpc endpoint. The reverse direction is export_code.
 
-const PLAYWRIGHT_PATH = "/home/jaime/projects/grweb-kraken/frontend/node_modules/playwright/index.mjs";
+import { execFileSync } from "node:child_process";
+
+const SLIMIUM = process.env.SLIMIUM || "/home/jaime/.local/bin/slimium";
 
 const USAGE = `usage: dom2figma.mjs <url> [options]
 
 Snapshot a rendered page and rebuild it in Figma via build_from_spec.
 
 options:
-  --cdp <url>        CDP endpoint of the browser  (default http://127.0.0.1:9395)
+  --session <name>   slimium session of the browser (default figma-fork)
   --rpc <url>        figma-mcp-go leader base URL (default http://127.0.0.1:1996)
   --sel <css>        root selector to migrate     (default document.body)
   --max-nodes <n>    stop after n emitted nodes   (default 300)
@@ -23,6 +26,7 @@ options:
   --position <x,y>   where build_from_spec places the root frame
                      (default: the root element's page position)
   --name <name>      root node name               (default: document.title)
+  --file <name>      target connected Figma file for the rpc (see list_files)
   --dry              print the spec JSON instead of posting it
 `;
 
@@ -33,7 +37,8 @@ const fail = (message) => {
 
 const parseArgs = (argv) => {
   const opts = {
-    cdp: "http://127.0.0.1:9395",
+    session: process.env.FIGMA_FORK_SESSION || "figma-fork",
+    file: process.env.FIGMA_FORK_FILE || "",
     rpc: "http://127.0.0.1:1996",
     sel: null,
     maxNodes: 300,
@@ -52,8 +57,11 @@ const parseArgs = (argv) => {
       return argv[++i];
     };
     switch (arg) {
-      case "--cdp":
-        opts.cdp = next();
+      case "--file":
+        opts.file = next();
+        break;
+      case "--session":
+        opts.session = next();
         break;
       case "--rpc":
         opts.rpc = next();
@@ -440,44 +448,33 @@ const lineOf = (counts) =>
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
-  let chromium;
-  try {
-    ({ chromium } = await import(PLAYWRIGHT_PATH));
-  } catch {
-    ({ chromium } = await import("playwright"));
-  }
+  const slim = (args, timeoutMs = 60000) =>
+    execFileSync(SLIMIUM, ["--session", opts.session, ...args], { encoding: "utf8", timeout: timeoutMs }).trim();
 
-  const browser = await chromium.connectOverCDP(opts.cdp);
-  const context = browser.contexts()[0];
-  const page = context ? await context.newPage() : await browser.newPage();
+  // Open a fresh tab via slimium; its line is "<id>	<url>	<title>" and it becomes current.
+  const openLine = slim(["open", opts.url, "--wait", "load"]);
+  const tabId = (openLine.split("	")[0] || "").trim();
   try {
-    if (context) {
-      try {
-        await context.grantPermissions(["local-network-access"]);
-      } catch (e) {
-        console.warn(`grantPermissions skipped: ${e.message}`);
-      }
-    }
-
-    await page.goto(opts.url, { waitUntil: "load", timeout: 45000 });
     try {
-      await page.waitForLoadState("networkidle", { timeout: Math.min(10000, opts.wait || 10000) });
+      slim(["wait-idle", "--idle", String(Math.min(1000, opts.wait || 1000))], Math.min(12000, (opts.wait || 4000) + 4000));
     } catch {
       // Pages with keepalive connections never go idle; --wait covers them.
     }
     try {
-      await page.evaluate(() => document.fonts.ready);
+      slim(["eval", "document.fonts.ready.then(() => 'fonts-ok')"]);
     } catch {
       // Font loading is best-effort.
     }
-    if (opts.wait > 0) await page.waitForTimeout(opts.wait);
+    if (opts.wait > 0) await new Promise((r) => setTimeout(r, opts.wait));
 
-    const result = await page.evaluate(walkPage, {
+    const expr = "(" + walkPage.toString() + ")(" + JSON.stringify({
       selector: opts.sel,
       maxNodes: opts.maxNodes,
       maxDepth: opts.maxDepth,
       snap: opts.snap,
-    });
+    }) + ")";
+    const raw = slim(["eval", expr], 120000);
+    const result = JSON.parse(raw);
     if (!result || !result.spec) {
       console.error(`nothing captured: ${(result && result.error) || "root element empty or hidden"}`);
       process.exitCode = 1;
@@ -502,7 +499,7 @@ async function main() {
     const res = await fetch(rpcUrl, {
       method: "POST",
       headers: headers,
-      body: JSON.stringify({ tool: "build_from_spec", params: { spec: result.spec, position: position, name: name } }),
+      body: JSON.stringify({ tool: "build_from_spec", file: opts.file, params: { spec: result.spec, position: position, name: name } }),
     });
     const body = await res.text();
     let json = null;
@@ -520,8 +517,9 @@ async function main() {
     console.log(JSON.stringify(json.data).slice(0, 2000));
   } finally {
     // Only the tab this script opened is closed, never the browser.
-    await page.close().catch(() => {});
-    await browser.close().catch(() => {});
+    if (tabId) {
+      try { slim(["close", tabId]); } catch {}
+    }
   }
 }
 
