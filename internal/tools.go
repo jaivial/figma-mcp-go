@@ -519,6 +519,39 @@ func RegisterPrompts(s *server.MCPServer) {
 			},
 		), nil
 	})
+
+	s.AddPrompt(mcp.NewPrompt("write_design_strategy",
+		mcp.WithPromptDescription("Best practices for WRITING/EDITING Figma designs with figma-mcp-go"),
+	), func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		return mcp.NewGetPromptResult(
+			"Best practices for writing and editing Figma designs",
+			[]mcp.PromptMessage{
+				mcp.NewPromptMessage(
+					mcp.RoleUser,
+					mcp.NewTextContent(`To effectively write or edit a Figma design with figma-mcp-go:
+
+0. Call list_files, then select_file before writing — never rely on the single-file default
+1. Call get_layout_context(nodeId) BEFORE creating or moving anything near existing content:
+   it tells you if the parent is auto layout (x/y writes are silently ignored there),
+   sibling geometry, page grid, and free space
+2. Prefer structure over coordinates: auto_layout to convert messy absolute groups;
+   place_node (converts absolute→local AND snaps, default 8px) over manual x/y;
+   align_nodes/distribute_nodes over hand-computed centering — never compute
+   (parent.width-child.width)/2 yourself
+3. Use set_text for ALL text edits — it loads every ranged font automatically;
+   never set .characters directly without loading fonts first
+4. execute_code: helpers are in scope (snap, round2, boundsOf, loadFonts, layoutInfo);
+   return ids/names/counts; the response includes an automatic changed-manifest;
+   rollback:true removes nodes created before a throw
+5. After every write batch: validate_layout (overlaps, out-of-bounds, inconsistent gaps,
+   off-grid, auto-layout overflow) and FIX the findings; screenshot (save_screenshots)
+   only as final visual confirmation
+6. Hygiene: name layers, remove probe nodes in the same call, keep Light/Dark + breakpoint
+   twin frames in sync, edit main components (not instances) for design-system changes`),
+				),
+			},
+		), nil
+	})
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

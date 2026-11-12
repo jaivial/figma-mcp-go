@@ -98,6 +98,22 @@ Watch the video:
 | `get_screenshot` | Base64 image export of any node |
 | `save_screenshots` | Export images to disk (server-side, no API call) |
 
+### Writing & layout
+
+| Tool | Description |
+|------|-------------|
+| `get_layout_context` | Layout around a node: parent auto-layout state, sibling geometry, page grid, free space — read it before writing near existing content |
+| `set_text` | Edit text safely — loads every ranged font automatically |
+| `place_node` | Place by absolute coordinates; converts to parent-local space and snaps (default 8px) |
+| `align_nodes` | Align nodes to each other or their parent — no hand-computed centering |
+| `distribute_nodes` | Space nodes evenly, horizontally or vertically |
+| `auto_layout` | Convert an absolute-positioned group into an auto-layout frame |
+| `validate_layout` | Find overlaps, out-of-bounds nodes, inconsistent gaps, off-grid nodes, auto-layout overflow |
+
+Node IDs use colon format (`4029:12345`), never hyphens. Nodes inside instances carry the
+instance prefix joined by a semicolon (`I80:165050;80:162650`) — pass IDs back exactly as
+returned.
+
 ---
 
 ## Several files at once
@@ -121,6 +137,51 @@ drive different files in parallel through the same leader.
 being an MCP server; run it as a service and every MCP process becomes a follower of it, so
 connections survive agent sessions ending. `FIGMA_MCP_PORT` changes the port (default 1994; the
 plugin's `ui.html` and `manifest.json` must use the same one).
+
+## Layout-safe workflow for AI agents
+
+The short version of the `write_design_strategy` prompt:
+
+0. **Pick the file first** — `list_files`, then `select_file`; never rely on the single-file default.
+1. **Look before you place** — `get_layout_context` before creating or moving anything near
+   existing content: it tells you if the parent is auto layout (x/y writes are silently
+   ignored there), sibling geometry, the page grid, and where free space is.
+2. **Structure over coordinates** — `auto_layout` to convert messy absolute groups;
+   `place_node` (converts absolute → local and snaps, default 8px) over manual x/y;
+   `align_nodes`/`distribute_nodes` over hand-computed centering — never compute
+   `(parent.width - child.width) / 2` yourself.
+3. **`set_text` for all text edits** — it loads every ranged font automatically; never set
+   `.characters` directly without loading fonts first.
+4. **`execute_code` for the rest** — helpers are in scope (`snap`, `round2`, `boundsOf`,
+   `loadFonts`, `layoutInfo`); return ids/names/counts; the response includes an automatic
+   changed-manifest, and `rollback: true` removes nodes created before a throw.
+5. **Validate every batch** — `validate_layout` (overlaps, out-of-bounds, inconsistent gaps,
+   off-grid, auto-layout overflow), fix the findings; `save_screenshots` only as final
+   visual confirmation.
+6. **Hygiene** — name layers, remove probe nodes in the same call, keep Light/Dark +
+   breakpoint twin frames in sync, edit main components (not instances) for design-system
+   changes.
+
+## Running a second instance side-by-side
+
+Each leader owns its port, so a second, fully independent instance just needs another one.
+Set `FIGMA_MCP_PORT` — e.g. `1996` — on the second leader:
+
+```ini
+# /etc/systemd/system/figma-mcp-go-fork-leader.service
+[Service]
+Environment=FIGMA_MCP_PORT=1996
+ExecStart=/usr/local/bin/figma-mcp-go leader
+```
+
+Everything follows the port: MCP processes started with the same `FIGMA_MCP_PORT` become
+followers of that leader, and the plugin's WebSocket URL does too — point `WS_URL` in
+`ui.html` (and the `allowedDomains` entry in `manifest.json`) at `ws://localhost:1996/ws`
+and import that variant as a separate development plugin for the files this instance
+should drive.
+
+`FIGMA_MCP_TOKEN` (optional) enables shared-secret authentication: when set, only clients
+presenting the same token are accepted.
 
 ## Contributing
 
