@@ -358,10 +358,43 @@ const handleRequest = async (request) => {
 
       case "execute_code": {
         const code = request.params && request.params.code;
+        const rollback = !!(request.params && request.params.rollback);
         if (typeof code !== "string" || !code.trim()) throw new Error("code is required");
         const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-        const run = new AsyncFunction("figma", code);
-        const result = await run(figma);
+        const preludeLines = EXEC_PRELUDE.split("\n").length;
+        const beforeIds = collectIds();
+        let run;
+        try {
+          run = new AsyncFunction("figma", EXEC_PRELUDE + "\n" + code);
+        } catch (error) {
+          // Syntax errors never run user code, so nothing could have changed.
+          return {
+            type: request.type,
+            requestId: request.requestId,
+            data: Object.assign(
+              { error: errorMessage(error), phase: "compile" },
+              locateUserCodeError(error, code, preludeLines)
+            ),
+          };
+        }
+        let result;
+        try {
+          result = await run(figma);
+        } catch (error) {
+          const diff = diffIds(beforeIds, collectIds());
+          const changed = diff ? await changeManifest(diff) : { skipped: "page too large" };
+          if (rollback && diff) changed.rolledBack = await rollbackCreated(diff.createdIds);
+          return {
+            type: request.type,
+            requestId: request.requestId,
+            data: Object.assign(
+              { error: errorMessage(error), phase: "run", changed: changed },
+              locateUserCodeError(error, code, preludeLines)
+            ),
+          };
+        }
+        const diff = diffIds(beforeIds, collectIds());
+        const changed = diff ? await changeManifest(diff) : { skipped: "page too large" };
         // Only JSON-safe data travels back (a node would not serialise).
         let data;
         try {
@@ -369,7 +402,18 @@ const handleRequest = async (request) => {
         } catch (e) {
           data = String(result);
         }
-        return { type: request.type, requestId: request.requestId, data: data };
+        return { type: request.type, requestId: request.requestId, data: { result: data, changed: changed } };
+      }
+
+      case "validate_layout": {
+        const nodeId = request.params && request.params.nodeId;
+        if (!nodeId) throw new Error("nodeId is required for validate_layout");
+        const root = await figma.getNodeByIdAsync(nodeId);
+        if (!root) throw new Error(`Node not found: ${nodeId}`);
+        const gridParam = (request.params && request.params.grid) || 8;
+        const grid = typeof gridParam === "number" && gridParam > 0 ? gridParam : 8;
+        const checks = validateChecks(request.params && request.params.checks);
+        return { type: request.type, requestId: request.requestId, data: validateLayout(root, grid, checks) };
       }
 
       default:
@@ -408,4 +452,353 @@ figma.ui.onmessage = async (message) => {
       });
     }
   }
+};
+
+// ── execute_code helpers ─────────────────────────────────────────────────────
+
+// Snippet prepended to every execute_code run: small helpers the user code can rely on.
+const EXEC_PRELUDE = `const snap = (v, g = 8) => Math.round(v / g) * g;
+const round2 = (v) => Math.round(v * 100) / 100;
+const boundsOf = (n) => {
+  const b = n && n.absoluteBoundingBox;
+  return b
+    ? { x: Math.round(b.x), y: Math.round(b.y), width: Math.round(b.width), height: Math.round(b.height) }
+    : undefined;
+};
+const loadFonts = async (...nodes) => {
+  const flat = nodes.flat(Infinity);
+  const fonts = new Set();
+  for (const n of flat) {
+    if (!n || n.type !== "TEXT") continue;
+    const font = n.fontName;
+    if (typeof font === "symbol") {
+      n.getRangeAllFontNames(0, n.characters.length).forEach((f) => fonts.add(f.family + "|" + f.style));
+    } else {
+      fonts.add(font.family + "|" + font.style);
+    }
+  }
+  await Promise.all(
+    Array.from(fonts).map((key) => {
+      const [family, style] = key.split("|");
+      return figma.loadFontAsync({ family: family, style: style });
+    })
+  );
+  return flat;
+};
+const layoutInfo = (f) => {
+  if (!f || !("layoutMode" in f) || !f.layoutMode || f.layoutMode === "NONE") return undefined;
+  return {
+    mode: f.layoutMode,
+    spacing: f.itemSpacing,
+    padding: { t: f.paddingTop, r: f.paddingRight, b: f.paddingBottom, l: f.paddingLeft },
+    primarySizing: f.primaryAxisSizingMode,
+    counterSizing: f.counterAxisSizingMode,
+  };
+};`;
+
+// Walk the current page collecting every node id; null when the page is too large to diff.
+const collectIds = (max = 20000) => {
+  const ids = new Set();
+  const stack = [figma.currentPage];
+  while (stack.length > 0) {
+    if (ids.size >= max) return null;
+    const node = stack.pop();
+    ids.add(node.id);
+    if ("children" in node && node.children) for (const child of node.children) stack.push(child);
+  }
+  return ids;
+};
+
+// Diff two page snapshots; null when either snapshot was skipped.
+const diffIds = (before, after) => {
+  if (!before || !after) return null;
+  return {
+    createdIds: Array.from(after).filter((id) => !before.has(id)),
+    removedIds: Array.from(before).filter((id) => !after.has(id)),
+  };
+};
+
+// Manifest of what a run changed: capped lists plus the full counts.
+const changeManifest = async (diff) => {
+  const nodes = await Promise.all(diff.createdIds.slice(0, 50).map((id) => figma.getNodeByIdAsync(id)));
+  return {
+    createdCount: diff.createdIds.length,
+    removedCount: diff.removedIds.length,
+    created: nodes.filter((n) => n !== null).map((n) => ({ id: n.id, name: n.name, type: n.type })),
+    removed: diff.removedIds.slice(0, 50),
+  };
+};
+
+// Best-effort rollback: delete the nodes a failed run created.
+const rollbackCreated = async (createdIds) => {
+  let removed = 0;
+  for (const id of createdIds) {
+    try {
+      const node = await figma.getNodeByIdAsync(id);
+      if (node && typeof node.remove === "function") {
+        node.remove();
+        removed++;
+      }
+    } catch (e) {
+      // Tolerated: the node may already be gone with a deleted parent.
+    }
+  }
+  return removed;
+};
+
+const errorMessage = (error) => (error instanceof Error ? error.message : String(error));
+
+// Locate an error in the user code: V8 frames read "at <anonymous>:L:C", where L counts
+// 2 AsyncFunction preamble lines plus the prelude before the first user-code line.
+const locateUserCodeError = (error, code, preludeLines) => {
+  const stack = error instanceof Error && typeof error.stack === "string" ? error.stack : "";
+  const stackLines = stack ? stack.split("\n") : [];
+  // A trailing bare "<anonymous>:L:C" is the user code; frames from this plugin file
+  // carry a script name or a function name before the location and must not match.
+  const frame = stackLines.find((l) => /(?:^|[\s(,])<anonymous>:\d+:\d+\)?\s*$/.test(l));
+  let line = null;
+  if (frame) {
+    const userLine = parseInt(frame.match(/<anonymous>:(\d+):\d+\)?\s*$/)[1], 10) - 2 - preludeLines;
+    if (userLine >= 1) line = userLine;
+  }
+  const codeLines = code.split("\n");
+  let codeExcerpt = null;
+  if (line !== null) {
+    codeExcerpt = [];
+    for (let i = Math.max(1, line - 2); i <= Math.min(codeLines.length, line + 2); i++) {
+      codeExcerpt.push(`${i}${i === line ? ">" : ":"} ${codeLines[i - 1]}`);
+    }
+  }
+  return { stackFirstLine: stackLines[0] || null, line: line, codeExcerpt: codeExcerpt };
+};
+
+// ── validate_layout helpers ──────────────────────────────────────────────────
+
+const VALID_CHECKS = ["overlap", "outOfBounds", "spacing", "grid", "hug"];
+
+// Normalise the checks argument: a subset of VALID_CHECKS, all of them when omitted.
+const validateChecks = (checks) => {
+  if (!Array.isArray(checks) || checks.length === 0) return VALID_CHECKS.slice();
+  const unknown = checks.filter((c) => !VALID_CHECKS.includes(c));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown checks: ${unknown.join(", ")} (valid: ${VALID_CHECKS.join(", ")})`);
+  }
+  return checks.slice();
+};
+
+const r2 = (v) => Math.round(v * 100) / 100;
+const boundingBox = (node) => (node && node.absoluteBoundingBox) || null;
+const renderBox = (node) => (node && node.absoluteRenderBounds) || null;
+
+// Full containment (with a small tolerance) is legal layering, not an overlap.
+const boxContains = (outer, inner) =>
+  inner.x >= outer.x - 0.5 &&
+  inner.y >= outer.y - 0.5 &&
+  inner.x + inner.width <= outer.x + outer.width + 0.5 &&
+  inner.y + inner.height <= outer.y + outer.height + 0.5;
+
+// Off-grid parent-local geometry of a node (auto-layout spacing/padding included).
+const offGridValues = (node, grid) => {
+  const values = {};
+  const collect = (key, v) => {
+    if (typeof v !== "number" || !isFinite(v)) return;
+    const rounded = r2(v);
+    if (rounded % grid !== 0) values[key] = rounded;
+  };
+  if ("x" in node) collect("x", node.x);
+  if ("y" in node) collect("y", node.y);
+  if ("width" in node) collect("width", node.width);
+  if ("height" in node) collect("height", node.height);
+  if ("layoutMode" in node && node.layoutMode && node.layoutMode !== "NONE") {
+    collect("itemSpacing", node.itemSpacing);
+    collect("paddingTop", node.paddingTop);
+    collect("paddingRight", node.paddingRight);
+    collect("paddingBottom", node.paddingBottom);
+    collect("paddingLeft", node.paddingLeft);
+  }
+  return values;
+};
+
+// Lint a subtree for the classic layout mistakes; see the validate_layout tool description.
+const validateLayout = (root, grid, checks) => {
+  const findings = [];
+  let scanned = 0;
+  let invisibleSkipped = 0;
+  let truncated = false;
+  const entries = [];
+  const walk = (node, parent) => {
+    if (scanned >= 3000) {
+      truncated = true;
+      return;
+    }
+    if ("visible" in node && !node.visible) {
+      invisibleSkipped++;
+      return;
+    }
+    scanned++;
+    entries.push({ node: node, parent: parent, bb: boundingBox(node), rb: renderBox(node) });
+    if ("children" in node && node.children) for (const child of node.children) walk(child, node);
+  };
+  walk(root, null);
+
+  // Sibling groups drive the overlap, spacing and hug checks.
+  const groups = new Map();
+  for (const entry of entries) {
+    if (!entry.parent) continue;
+    if (!groups.has(entry.parent)) groups.set(entry.parent, []);
+    groups.get(entry.parent).push(entry);
+  }
+  const isAutoLayout = (node) => "layoutMode" in node && node.layoutMode && node.layoutMode !== "NONE";
+
+  if (checks.includes("overlap")) {
+    for (const children of groups.values()) {
+      for (let i = 0; i < children.length; i++) {
+        for (let j = i + 1; j < children.length; j++) {
+          const a = children[i];
+          const b = children[j];
+          if (!a.rb || !b.rb) continue;
+          const w = Math.min(a.rb.x + a.rb.width, b.rb.x + b.rb.width) - Math.max(a.rb.x, b.rb.x);
+          const h = Math.min(a.rb.y + a.rb.height, b.rb.y + b.rb.height) - Math.max(a.rb.y, b.rb.y);
+          if (w <= 0 || h <= 0 || w * h <= 1) continue;
+          if (boxContains(a.rb, b.rb) || boxContains(b.rb, a.rb)) continue;
+          findings.push({
+            severity: "warn",
+            nodeId: a.node.id,
+            name: a.node.name,
+            otherId: b.node.id,
+            otherName: b.node.name,
+            message: `partial overlap ${r2(w)}x${r2(h)} px`,
+          });
+        }
+      }
+    }
+  }
+
+  if (checks.includes("outOfBounds")) {
+    for (const entry of entries) {
+      if (!entry.parent || !entry.bb) continue;
+      const pb = boundingBox(entry.parent);
+      if (!pb) continue;
+      const cb = entry.bb;
+      const delta = {};
+      if (pb.x - cb.x > 1) delta.left = r2(pb.x - cb.x);
+      if (cb.x + cb.width - (pb.x + pb.width) > 1) delta.right = r2(cb.x + cb.width - (pb.x + pb.width));
+      if (pb.y - cb.y > 1) delta.top = r2(pb.y - cb.y);
+      if (cb.y + cb.height - (pb.y + pb.height) > 1) delta.bottom = r2(cb.y + cb.height - (pb.y + pb.height));
+      if (Object.keys(delta).length === 0) continue;
+      const sides = Object.entries(delta).map(([side, px]) => `${side}=${px}px`).join(", ");
+      findings.push({
+        severity: entry.parent.clipsContent ? "info" : "warn",
+        nodeId: entry.node.id,
+        name: entry.node.name,
+        parentId: entry.parent.id,
+        parentName: entry.parent.name,
+        delta: delta,
+        message: `child extends beyond parent by ${sides}`,
+      });
+    }
+  }
+
+  if (checks.includes("spacing")) {
+    for (const [parent, children] of groups) {
+      if (isAutoLayout(parent)) continue;
+      const boxes = children.filter((c) => c.bb).map((c) => c.bb);
+      if (boxes.length < 3) continue;
+      const xs = boxes.map((b) => b.x);
+      const ys = boxes.map((b) => b.y);
+      const sameColumn = Math.max(...xs) - Math.min(...xs) < 2;
+      const sameRow = Math.max(...ys) - Math.min(...ys) < 2;
+      if (!sameColumn && !sameRow) continue;
+      const axis = sameColumn ? "y" : "x";
+      boxes.sort((a, b) => a[axis] - b[axis]);
+      const gaps = [];
+      for (let i = 0; i < boxes.length - 1; i++) {
+        gaps.push(r2(axis === "y" ? boxes[i + 1].y - (boxes[i].y + boxes[i].height) : boxes[i + 1].x - (boxes[i].x + boxes[i].width)));
+      }
+      if (Math.max(...gaps) - Math.min(...gaps) > 1) {
+        findings.push({
+          severity: "warn",
+          nodeId: parent.id,
+          name: parent.name,
+          message: `inconsistent gaps: [${gaps.join(", ")}]`,
+          gaps: gaps,
+        });
+      }
+    }
+  }
+
+  if (checks.includes("grid")) {
+    let gridFindings = 0;
+    for (const entry of entries) {
+      if (gridFindings >= 30) break;
+      const values = offGridValues(entry.node, grid);
+      if (Object.keys(values).length === 0) continue;
+      gridFindings++;
+      findings.push({
+        severity: "info",
+        nodeId: entry.node.id,
+        name: entry.node.name,
+        message: `off grid: ${Object.entries(values).map(([key, v]) => `${key}=${v}`).join(", ")}`,
+        values: values,
+      });
+    }
+  }
+
+  if (checks.includes("hug")) {
+    for (const [parent, children] of groups) {
+      if (!isAutoLayout(parent)) continue;
+      const kids = children.filter((c) => "width" in c.node && "height" in c.node);
+      if (kids.length === 0) continue;
+      const horizontal = parent.layoutMode === "HORIZONTAL";
+      const spacing = typeof parent.itemSpacing === "number" ? parent.itemSpacing : 0;
+      const sizes = kids.map((c) => (horizontal ? c.node.width : c.node.height));
+      const primaryTotal =
+        sizes.reduce((a, b) => a + b, 0) +
+        spacing * (kids.length - 1) +
+        (horizontal ? parent.paddingLeft + parent.paddingRight : parent.paddingTop + parent.paddingBottom);
+      if (parent.primaryAxisSizingMode === "FIXED") {
+        const size = horizontal ? parent.width : parent.height;
+        if (primaryTotal - size > 1) {
+          findings.push({
+            severity: "warn",
+            nodeId: parent.id,
+            name: parent.name,
+            message: `auto-layout overflow: ${r2(primaryTotal - size)}px on ${horizontal ? "horizontal" : "vertical"} axis`,
+            overflow: r2(primaryTotal - size),
+          });
+        }
+      }
+      if (parent.counterAxisSizingMode === "FIXED") {
+        const counterSizes = kids.map((c) => (horizontal ? c.node.height : c.node.width));
+        const counterTotal =
+          Math.max(...counterSizes) +
+          (horizontal ? parent.paddingTop + parent.paddingBottom : parent.paddingLeft + parent.paddingRight);
+        const size = horizontal ? parent.height : parent.width;
+        if (counterTotal - size > 1) {
+          findings.push({
+            severity: "warn",
+            nodeId: parent.id,
+            name: parent.name,
+            message: `auto-layout overflow: ${r2(counterTotal - size)}px on ${horizontal ? "vertical" : "horizontal"} axis`,
+            overflow: r2(counterTotal - size),
+          });
+        }
+      }
+    }
+  }
+
+  findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === "warn" ? -1 : 1));
+  const summary = { warn: 0, info: 0 };
+  for (const finding of findings) summary[finding.severity]++;
+  const data = {
+    nodeId: root.id,
+    name: root.name,
+    checksRun: checks,
+    scanned: scanned,
+    invisibleSkipped: invisibleSkipped,
+    summary: summary,
+    findings: findings.slice(0, 100),
+  };
+  if (truncated) data.truncated = true;
+  return data;
 };
