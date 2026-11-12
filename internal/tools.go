@@ -343,6 +343,38 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		return renderResponse(resp, err)
 	})
 
+	s.AddTool(mcp.NewTool("export_code",
+		withFile(),
+		mcp.WithDescription("Export a Figma subtree as HTML+Tailwind (default), React+Tailwind JSX, or JSON AST. "+
+			"Auto-layout maps to flex utilities (gap/padding/justify/items), absolute frames to positioned divs, "+
+			"text styles to type utilities. Use for Figma→code migration, then map utilities to the target project's tokens."),
+		mcp.WithString("nodeId",
+			mcp.Required(),
+			mcp.Description("Root node ID to export, colon format e.g. '4029:12345'"),
+		),
+		mcp.WithString("flavor",
+			mcp.Enum("html-tailwind", "react-tailwind", "json"),
+			mcp.Description("Output flavor: html-tailwind (default), react-tailwind (JSX), or json (serialized AST)"),
+		),
+		mcp.WithNumber("maxNodes",
+			mcp.Description("Maximum nodes to walk before truncating the output (default 2000)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeID, _ := req.Params.Arguments["nodeId"].(string)
+		if strings.TrimSpace(nodeID) == "" {
+			return mcp.NewToolResultError("nodeId is required"), nil
+		}
+		params := map[string]interface{}{"nodeId": nodeID}
+		if flavor, ok := req.Params.Arguments["flavor"].(string); ok && flavor != "" {
+			params["flavor"] = flavor
+		}
+		if maxNodes, ok := req.Params.Arguments["maxNodes"].(float64); ok && maxNodes > 0 {
+			params["maxNodes"] = maxNodes
+		}
+		resp, err := node.Send(ctx, fileArg(req), "export_code", nil, params)
+		return renderResponse(resp, err)
+	})
+
 	s.AddTool(mcp.NewTool("save_screenshots",
 		withFile(),
 		mcp.WithDescription("Export screenshots for multiple nodes and save them to the local filesystem. Returns metadata only (no base64)."),
