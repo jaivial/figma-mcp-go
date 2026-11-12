@@ -434,18 +434,60 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		mcp.WithDescription("Run JavaScript against the Figma Plugin API in the open file and return its result. "+
 			"The code is the body of an async function with `figma` in scope: use `await`, and `return` a JSON-serialisable value "+
 			"(node ids, names, counts — not nodes). This is the write tool: create/modify/delete nodes, components, variants, "+
-			"styles, prototype reactions. Load fonts before editing text (await figma.loadFontAsync(...)); "+
+			"styles, prototype reactions. Helpers are already in scope: snap(v, g=8) snaps to a grid, round2(v) rounds to 2 decimals, "+
+			"boundsOf(n) returns rounded absolute bounds, loadFonts(...nodes) loads every font used by the given text nodes, "+
+			"and layoutInfo(f) summarises auto-layout. Every response carries a changed manifest (created/removed node ids and names); "+
+			"on error it names the failing user-code line with a code excerpt (compile errors included). "+
+			"Set rollback=true to delete the nodes a failed run created. "+
+			"Load fonts before editing text (await figma.loadFontAsync(...)); "+
 			"use figma.getNodeByIdAsync and page.loadAsync(). Keep each call under ~25 s; split big jobs into several calls."),
 		mcp.WithString("code",
 			mcp.Required(),
 			mcp.Description("Async function body, e.g. `const n = figma.createRectangle(); n.resize(100, 40); return n.id;`"),
+		),
+		mcp.WithBoolean("rollback",
+			mcp.Description("On error, delete every node the run created (best effort)"),
 		),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		code, _ := req.Params.Arguments["code"].(string)
 		if strings.TrimSpace(code) == "" {
 			return mcp.NewToolResultError("code is required"), nil
 		}
-		resp, err := node.Send(ctx, fileArg(req), "execute_code", nil, map[string]interface{}{"code": code})
+		params := map[string]interface{}{"code": code}
+		if rollback, ok := req.Params.Arguments["rollback"].(bool); ok && rollback {
+			params["rollback"] = true
+		}
+		resp, err := node.Send(ctx, fileArg(req), "execute_code", nil, params)
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("validate_layout",
+		withFile(),
+		mcp.WithDescription("Lint a subtree for the classic AI layout mistakes: overlapping siblings, children outside parent bounds, "+
+			"inconsistent gaps, off-grid values, auto-layout overflow. Run after every write batch; fix findings instead of screenshot-guessing."),
+		mcp.WithString("nodeId",
+			mcp.Required(),
+			mcp.Description("Root node ID to validate, colon format e.g. '4029:12345'"),
+		),
+		mcp.WithNumber("grid",
+			mcp.Description("Grid size in px (default 8)"),
+		),
+		mcp.WithArray("checks",
+			mcp.Description("Subset of checks to run: overlap, outOfBounds, spacing, grid, hug (default all)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeID, _ := req.Params.Arguments["nodeId"].(string)
+		if strings.TrimSpace(nodeID) == "" {
+			return mcp.NewToolResultError("nodeId is required"), nil
+		}
+		params := map[string]interface{}{"nodeId": nodeID}
+		if grid, ok := req.Params.Arguments["grid"].(float64); ok && grid > 0 {
+			params["grid"] = grid
+		}
+		if raw, ok := req.Params.Arguments["checks"].([]interface{}); ok && len(raw) > 0 {
+			params["checks"] = raw
+		}
+		resp, err := node.Send(ctx, fileArg(req), "validate_layout", nil, params)
 		return renderResponse(resp, err)
 	})
 }
