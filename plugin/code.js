@@ -943,6 +943,27 @@ const handleRequest = async (request) => {
         };
       }
 
+      case "export_code": {
+        const params = request.params || {};
+        const nodeId = (request.nodeIds && request.nodeIds[0]) || params.nodeId;
+        if (!nodeId) throw new Error("nodeId is required for export_code");
+        const flavor = params.flavor || "html-tailwind";
+        if (!EXPORT_FLAVORS.includes(flavor)) {
+          throw new Error(`Invalid flavor: ${flavor} (${EXPORT_FLAVORS.join("|")})`);
+        }
+        const classCase = params.classCase || "tailwind";
+        if (classCase !== "tailwind") throw new Error(`Invalid classCase: ${classCase} (tailwind)`);
+        const maxNodes =
+          typeof params.maxNodes === "number" && params.maxNodes > 0 ? Math.floor(params.maxNodes) : 2000;
+        const root = await figma.getNodeByIdAsync(nodeId);
+        if (!root || root.type === "DOCUMENT") throw new Error(`Node not found: ${nodeId}`);
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: buildExportCode(root, { flavor: flavor, maxNodes: maxNodes }),
+        };
+      }
+
       default:
         throw new Error(`Unknown request type: ${request.type}`);
     }
@@ -1473,5 +1494,328 @@ const validateLayout = (root, grid, checks) => {
     findings: findings.slice(0, 100),
   };
   if (truncated) data.truncated = true;
+  return data;
+};
+
+// ── export_code helpers ──────────────────────────────────────────────────────
+
+const EXPORT_FLAVORS = ["html-tailwind", "react-tailwind", "json"];
+// primaryAxisAlignItems → justify-*, counterAxisAlignItems → items-*.
+const EXPORT_JUSTIFY = { MIN: "justify-start", CENTER: "justify-center", MAX: "justify-end", SPACE_BETWEEN: "justify-between" };
+const EXPORT_ITEMS = { MIN: "items-start", CENTER: "items-center", MAX: "items-end" };
+const EXPORT_TEXT_ALIGN = { CENTER: "text-center", RIGHT: "text-right", JUSTIFIED: "text-justify" };
+
+const escapeHtmlText = (text) =>
+  String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Characters inside a JSX {"..."} string literal.
+const escapeJsxText = (text) =>
+  String(text).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "").replace(/\n/g, "\\n");
+
+// Layer names travel inside comments: keep them from closing the comment early.
+const exportCommentName = (name, jsx) => {
+  const clean = String(name).replace(/[\r\n]+/g, " ");
+  return jsx ? clean.replace(/\*\//g, "* /") : clean.replace(/--+/g, "-");
+};
+
+// "hero card v2" → "HeroCardV2"; anything unparsable → "ExportedNode".
+const exportPascalCase = (name) => {
+  const parts = String(name || "").split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  const joined = parts.map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("");
+  if (!joined) return "ExportedNode";
+  return /^[0-9]/.test(joined) ? `Figma${joined}` : joined;
+};
+
+const dedupeClasses = (classes) => Array.from(new Set(classes.filter(Boolean)));
+
+// First visible, non-transparent SOLID paint as "#hex" (null when absent).
+const exportPaintHex = (paints) => {
+  if (!Array.isArray(paints)) return null;
+  const paint = paints.find((p) => p && p.type === "SOLID" && p.visible !== false && p.opacity !== 0 && p.color);
+  return paint ? toHex(paint.color) : null;
+};
+
+const exportFillClass = (node) => {
+  if (!("fills" in node) || isMixed(node.fills)) return null;
+  const hex = exportPaintHex(node.fills);
+  return hex ? `bg-[${hex}]` : null;
+};
+
+// Uniform strokeWeight, or the largest per-side weight when it is mixed.
+const exportStrokeWeight = (node) => {
+  if (typeof node.strokeWeight === "number") return node.strokeWeight;
+  const sides = ["strokeTopWeight", "strokeRightWeight", "strokeBottomWeight", "strokeLeftWeight"]
+    .map((key) => node[key])
+    .filter((v) => typeof v === "number");
+  return sides.length > 0 ? Math.max(...sides) : null;
+};
+
+const exportBorderClasses = (node) => {
+  if (!("strokes" in node) || isMixed(node.strokes)) return [];
+  const hex = exportPaintHex(node.strokes);
+  if (!hex) return [];
+  const weight = exportStrokeWeight(node);
+  if (typeof weight !== "number" || weight <= 0) return [];
+  return [`border-[${round2(weight)}px]`, `border-[${hex}]`];
+};
+
+// "rounded-[Npx]", a four-corner arbitrary value when mixed, or null.
+const exportRadiusClass = (node) => {
+  if (!("cornerRadius" in node)) return null;
+  if (typeof node.cornerRadius === "number" && node.cornerRadius > 0) {
+    return `rounded-[${round2(node.cornerRadius)}px]`;
+  }
+  if (isMixed(node.cornerRadius)) {
+    const corners = [node.topLeftRadius, node.topRightRadius, node.bottomRightRadius, node.bottomLeftRadius];
+    if (corners.every((v) => typeof v === "number")) {
+      return `rounded-[${corners.map((c) => round2(c)).join("_")}px]`;
+    }
+  }
+  return null;
+};
+
+// Fixed w/h classes from whatever geometry the node actually has.
+const exportSizeClasses = (node, roundToInt) => {
+  const classes = [];
+  const fmt = (v) => (roundToInt ? Math.round(v) : round2(v)) + "px";
+  if (typeof node.width === "number") classes.push(`w-[${fmt(node.width)}]`);
+  if (typeof node.height === "number") classes.push(`h-[${fmt(node.height)}]`);
+  return classes;
+};
+
+// Absolute children of a plain frame: parent-local, rounded to integers.
+const exportAbsoluteClasses = (node) => {
+  if (typeof node.x !== "number" || typeof node.y !== "number") return [];
+  return ["absolute", `left-[${Math.round(node.x)}px]`, `top-[${Math.round(node.y)}px]`, ...exportSizeClasses(node, true)];
+};
+
+// fontName.style → weight class (SemiBold must be checked before Bold).
+const exportWeightClass = (style) => {
+  if (typeof style !== "string") return null;
+  if (/semibold/i.test(style)) return "font-semibold";
+  if (/bold/i.test(style)) return "font-bold";
+  if (/medium/i.test(style)) return "font-medium";
+  return null;
+};
+
+// Flex utilities for an auto-layout frame, in spec order.
+const exportAutoLayoutClasses = (node) => {
+  const classes = ["flex", node.layoutMode === "VERTICAL" ? "flex-col" : "flex-row"];
+  if (typeof node.itemSpacing === "number" && node.itemSpacing !== 0) {
+    classes.push(`gap-[${round2(node.itemSpacing)}px]`);
+  }
+  const padding = {
+    top: node.paddingTop,
+    right: node.paddingRight,
+    bottom: node.paddingBottom,
+    left: node.paddingLeft,
+  };
+  const sides = Object.values(padding);
+  if (sides.every((v) => typeof v === "number") && sides.every((v) => v === sides[0]) && sides[0] > 0) {
+    classes.push(`p-[${round2(sides[0])}px]`);
+  } else {
+    const prefix = { top: "pt", right: "pr", bottom: "pb", left: "pl" };
+    for (const side of ["top", "right", "bottom", "left"]) {
+      if (typeof padding[side] === "number" && padding[side] > 0) {
+        classes.push(`${prefix[side]}-[${round2(padding[side])}px]`);
+      }
+    }
+  }
+  const justify = EXPORT_JUSTIFY[node.primaryAxisAlignItems];
+  if (justify) classes.push(justify);
+  const items = EXPORT_ITEMS[node.counterAxisAlignItems];
+  if (items) classes.push(items);
+  // Fixed sizes: the primary axis sizes the main dimension, the counter axis the other; hug omits.
+  const horizontal = node.layoutMode === "HORIZONTAL";
+  if (node.primaryAxisSizingMode === "FIXED" && typeof (horizontal ? node.width : node.height) === "number") {
+    classes.push(`${horizontal ? "w" : "h"}-[${round2(horizontal ? node.width : node.height)}px]`);
+  }
+  if (node.counterAxisSizingMode === "FIXED" && typeof (horizontal ? node.height : node.width) === "number") {
+    classes.push(`${horizontal ? "h" : "w"}-[${round2(horizontal ? node.height : node.width)}px]`);
+  }
+  if (node.clipsContent === true) classes.push("overflow-hidden");
+  const fill = exportFillClass(node);
+  if (fill) classes.push(fill);
+  const radius = exportRadiusClass(node);
+  if (radius) classes.push(radius);
+  classes.push(...exportBorderClasses(node));
+  return classes;
+};
+
+// Typography utilities for a TEXT node, in spec order.
+const exportTextClasses = (node) => {
+  const classes = [];
+  if (typeof node.fontSize === "number") classes.push(`text-[${round2(node.fontSize)}px]`);
+  const style = node.fontName && !isMixed(node.fontName) ? node.fontName.style : null;
+  const weight = exportWeightClass(style);
+  if (weight) classes.push(weight);
+  // Text fills are the text color, not a background.
+  if ("fills" in node && !isMixed(node.fills)) {
+    const hex = exportPaintHex(node.fills);
+    if (hex) classes.push(`text-[${hex}]`);
+  }
+  const align = EXPORT_TEXT_ALIGN[node.textAlignHorizontal];
+  if (align) classes.push(align);
+  const lineHeight = !isMixed(node.lineHeight) && node.lineHeight && typeof node.lineHeight === "object" ? node.lineHeight : null;
+  if (lineHeight && lineHeight.unit === "PIXELS" && typeof lineHeight.value === "number") {
+    classes.push(`leading-[${round2(lineHeight.value)}px]`);
+  }
+  if (typeof node.letterSpacing === "number" && node.letterSpacing > 0) {
+    classes.push(`tracking-[${round2(node.letterSpacing)}px]`);
+  }
+  if (node.textAutoResize === "NONE" && typeof node.width === "number") {
+    classes.push(`w-[${round2(node.width)}px]`);
+  }
+  return classes;
+};
+
+// Capped JSON tree built on the standard serializer.
+const exportJsonTree = (node, ctx, depth) => {
+  if ("visible" in node && !node.visible) return null;
+  if (ctx.nodes >= ctx.maxNodes) {
+    ctx.truncated = true;
+    return null;
+  }
+  ctx.nodes++;
+  ctx.maxDepth = Math.max(ctx.maxDepth, depth + 1);
+  const serialized = serializeNode(node);
+  if (serialized.children) {
+    const children = [];
+    for (const child of node.children) {
+      const childTree = exportJsonTree(child, ctx, depth + 1);
+      if (childTree) children.push(childTree);
+    }
+    serialized.children = children;
+  }
+  return serialized;
+};
+
+// Emit one node as indented markup lines into ctx.lines (html + react flavors).
+const exportMarkupNode = (node, ctx, depth, absoluteParent) => {
+  if ("visible" in node && !node.visible) return;
+  if (ctx.nodes >= ctx.maxNodes) {
+    ctx.truncated = true;
+    return;
+  }
+  ctx.nodes++;
+  ctx.maxDepth = Math.max(ctx.maxDepth, depth + 1);
+  const indent = "  ".repeat(depth);
+  const attrName = ctx.react ? "className" : "class";
+  // At depth 0 a JSX child comment would sit outside any element, so use a JS comment.
+  const comment = (text) => {
+    const body = exportCommentName(text, ctx.react);
+    if (ctx.react && depth === 0) ctx.lines.push(`// ${body}`);
+    else if (ctx.react) ctx.lines.push(`${indent}{/* ${body} */}`);
+    else ctx.lines.push(`${indent}<!-- ${body} -->`);
+  };
+  const leaf = (classes) => {
+    const attr = `${attrName}="${dedupeClasses(classes).join(" ")}"`;
+    ctx.lines.push(ctx.react ? `${indent}<div ${attr} />` : `${indent}<div ${attr}></div>`);
+  };
+  const container = (classes, children, absoluteChildren) => {
+    const attr = `${attrName}="${dedupeClasses(classes).join(" ")}"`;
+    const open = `${indent}<div ${attr}>`;
+    ctx.lines.push(open);
+    const before = ctx.lines.length;
+    for (const child of children) exportMarkupNode(child, ctx, depth + 1, absoluteChildren);
+    if (ctx.lines.length === before) {
+      // Nothing was emitted (empty or capped children): self-close in JSX, collapse in HTML.
+      if (ctx.react) ctx.lines[before - 1] = `${open.slice(0, -1)} />`;
+      else ctx.lines[before - 1] = `${open}</div>`;
+      return;
+    }
+    ctx.lines.push(`${indent}</div>`);
+  };
+
+  if (node.type === "COMPONENT" || node.type === "INSTANCE") {
+    comment(`component: ${node.name} (${node.id})`);
+  }
+  const positionClasses = absoluteParent ? exportAbsoluteClasses(node) : [];
+
+  if (node.layoutMode === "VERTICAL" || node.layoutMode === "HORIZONTAL") {
+    container([...positionClasses, ...exportAutoLayoutClasses(node)], node.children || [], false);
+    return;
+  }
+
+  if (node.type === "TEXT") {
+    const classes = [...positionClasses, ...exportTextClasses(node)];
+    if (!node.characters) {
+      leaf(classes);
+      return;
+    }
+    const attr = `${attrName}="${dedupeClasses(classes).join(" ")}"`;
+    if (ctx.react) {
+      ctx.lines.push(`${indent}<div ${attr}>{"${escapeJsxText(node.characters)}"}</div>`);
+    } else {
+      ctx.lines.push(`${indent}<div ${attr}>${escapeHtmlText(node.characters)}</div>`);
+    }
+    return;
+  }
+
+  if (node.type === "RECTANGLE" || node.type === "ELLIPSE") {
+    const classes = positionClasses.length > 0 ? positionClasses.slice() : exportSizeClasses(node, false);
+    if (node.type === "ELLIPSE") classes.push("rounded-full");
+    else {
+      const radius = exportRadiusClass(node);
+      if (radius) classes.push(radius);
+    }
+    const fill = exportFillClass(node);
+    if (fill) classes.push(fill);
+    classes.push(...exportBorderClasses(node));
+    leaf(classes);
+    return;
+  }
+
+  if ("children" in node && node.children && node.children.length > 0 && node.type !== "BOOLEAN_OPERATION") {
+    // Plain frame / group / section: fixed-size box, children positioned absolutely.
+    const classes = positionClasses.length > 0 ? positionClasses.slice() : exportSizeClasses(node, false);
+    classes.push("relative");
+    const fill = exportFillClass(node);
+    if (fill) classes.push(fill);
+    const radius = exportRadiusClass(node);
+    if (radius) classes.push(radius);
+    classes.push(...exportBorderClasses(node));
+    if (node.clipsContent === true) classes.push("overflow-hidden");
+    container(classes, node.children, true);
+    return;
+  }
+
+  // Unsupported leaf (VECTOR, LINE, POLYGON, …): geometry placeholder with a comment marker.
+  const classes = positionClasses.length > 0 ? positionClasses.slice() : exportSizeClasses(node, false);
+  const fill = exportFillClass(node);
+  if (fill) classes.push(fill);
+  classes.push(...exportBorderClasses(node));
+  comment(`${node.type}: ${node.name} (${node.id})`);
+  leaf(classes);
+};
+
+// Build the export payload shared by every flavor.
+const buildExportCode = (root, options) => {
+  const ctx = {
+    react: options.flavor === "react-tailwind",
+    maxNodes: options.maxNodes,
+    nodes: 0,
+    maxDepth: 0,
+    truncated: false,
+    lines: [],
+  };
+  let code;
+  if (options.flavor === "json") {
+    code = JSON.stringify(exportJsonTree(root, ctx, 0), null, 2);
+  } else {
+    if (ctx.react) {
+      ctx.lines.push(`// Suggested component: ${exportPascalCase(root.name)} (from "${exportCommentName(root.name, true)}")`);
+    }
+    exportMarkupNode(root, ctx, 0, false);
+    code = ctx.lines.join("\n");
+  }
+  const data = {
+    code: code,
+    stats: { nodes: ctx.nodes, lines: code.split("\n").length, depth: ctx.maxDepth },
+  };
+  if (ctx.truncated) {
+    data.truncated = true;
+    data.note = `subtree capped at maxNodes (${options.maxNodes}): output truncated`;
+  }
   return data;
 };
