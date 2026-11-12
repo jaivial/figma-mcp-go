@@ -992,7 +992,6 @@ const ALIGN_TO_COUNTER_AXIS = {
   bottom: "MAX",
 };
 
-const round2 = (value) => (typeof value === "number" && isFinite(value) ? Math.round(value * 100) / 100 : value);
 
 const requestNodeIds = (request) => {
   if (request.nodeIds && request.nodeIds.length > 0) return request.nodeIds;
