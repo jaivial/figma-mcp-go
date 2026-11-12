@@ -245,6 +245,188 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		return executeSaveScreenshots(ctx, node, req)
 	})
 
+	// ── Layout writes ────────────────────────────────────────────────────
+
+	s.AddTool(mcp.NewTool("set_text",
+		withFile(),
+		mcp.WithDescription("Set the text and typography of an existing TEXT node: characters, fontSize, fontName, "+
+			"textAlignHorizontal, textAutoResize. Loads every font the node currently uses (plus the fontName override) "+
+			"before writing, and applies font/style before characters. Safer than execute_code for text edits."),
+		mcp.WithString("nodeId",
+			mcp.Required(),
+			mcp.Description("TEXT node ID in colon format e.g. '4029:12345'"),
+		),
+		mcp.WithString("characters",
+			mcp.Description("Replacement text"),
+		),
+		mcp.WithNumber("fontSize",
+			mcp.Description("Font size in px"),
+		),
+		mcp.WithObject("fontName",
+			mcp.Properties(map[string]interface{}{
+				"family": map[string]interface{}{"type": "string", "description": "Font family e.g. 'Inter'"},
+				"style":  map[string]interface{}{"type": "string", "description": "Font style e.g. 'Regular' or 'Bold'"},
+			}),
+			mcp.Description("Font override {family, style}; applied to the whole node"),
+		),
+		mcp.WithString("textAlignHorizontal",
+			mcp.Enum("LEFT", "CENTER", "RIGHT", "JUSTIFIED"),
+			mcp.Description("Horizontal text alignment"),
+		),
+		mcp.WithString("textAutoResize",
+			mcp.Enum("NONE", "WIDTH_AND_HEIGHT", "HEIGHT", "TRUNCATE"),
+			mcp.Description("Auto-resize behaviour of the text node"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeID, _ := req.Params.Arguments["nodeId"].(string)
+		if nodeID == "" {
+			return mcp.NewToolResultError("nodeId is required"), nil
+		}
+		resp, err := node.Send(ctx, fileArg(req), "set_text", []string{nodeID},
+			paramsFrom(req, "characters", "fontSize", "fontName", "textAlignHorizontal", "textAutoResize"))
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("place_node",
+		withFile(),
+		mcp.WithDescription("Move and/or reparent a node. `position` is in ABSOLUTE page coordinates and is converted "+
+			"to the parent's local space via the parent's absoluteTransform (never naive subtraction), then snapped to an "+
+			"8px grid by default; `relative` is already parent-local. Do NOT set x/y on children of auto-layout parents — "+
+			"Figma silently ignores it; this tool detects auto-layout and uses child order (`after`) plus parent alignment "+
+			"instead, reporting mode 'auto-layout'. Refuses nodes inside instances (edit the main component)."),
+		mcp.WithString("nodeId",
+			mcp.Required(),
+			mcp.Description("Node ID to place, colon format e.g. '4029:12345'"),
+		),
+		mcp.WithString("parentId",
+			mcp.Description("Optional target parent node ID; default keeps the current parent"),
+		),
+		mcp.WithObject("position",
+			mcp.Properties(map[string]interface{}{
+				"x": map[string]interface{}{"type": "number", "description": "Absolute page x"},
+				"y": map[string]interface{}{"type": "number", "description": "Absolute page y"},
+			}),
+			mcp.Description("Absolute page coordinates {x, y}; converted to parent-local and snapped"),
+		),
+		mcp.WithObject("relative",
+			mcp.Properties(map[string]interface{}{
+				"x": map[string]interface{}{"type": "number", "description": "Parent-local x"},
+				"y": map[string]interface{}{"type": "number", "description": "Parent-local y"},
+			}),
+			mcp.Description("Parent-local coordinates {x, y}; used as-is, then snapped"),
+		),
+		mcp.WithString("after",
+			mcp.Description("Sibling node ID to insert after; in auto-layout parents this sets the order"),
+		),
+		mcp.WithString("align",
+			mcp.Enum("left", "hcenter", "right", "top", "vcenter", "bottom"),
+			mcp.Description("Align within the parent: absolute parents align to the content box (bounds minus paddings); "+
+				"auto-layout parents set counterAxisAlignItems only when the node is the only child — per-child alignment "+
+				"inside auto-layout needs a nested frame"),
+		),
+		mcp.WithNumber("snap",
+			mcp.Description("Snap grid in px for the local position (default 8; <= 0 disables snapping)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeID, _ := req.Params.Arguments["nodeId"].(string)
+		if nodeID == "" {
+			return mcp.NewToolResultError("nodeId is required"), nil
+		}
+		resp, err := node.Send(ctx, fileArg(req), "place_node", []string{nodeID},
+			paramsFrom(req, "parentId", "position", "relative", "after", "align", "snap"))
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("align_nodes",
+		withFile(),
+		mcp.WithDescription("Align several nodes to a shared reference box: the union of the nodes' absolute bounding boxes, "+
+			"or a `relativeTo` node. Moves are applied as local deltas, so nodes inside auto-layout parents are skipped with "+
+			"'inside auto-layout parent: use order/padding', nodes with rotated ancestors with 'rotated ancestor — manual "+
+			"handling needed', and nodes inside instances are skipped too. Per-node errors come back in results; the other "+
+			"nodes still apply."),
+		mcp.WithArray("nodeIds",
+			mcp.Required(),
+			mcp.Description("Node IDs to align, colon format e.g. ['4029:12345', '4029:67890']"),
+		),
+		mcp.WithString("mode",
+			mcp.Required(),
+			mcp.Enum("left", "hcenter", "right", "top", "vcenter", "bottom"),
+			mcp.Description("Alignment mode"),
+		),
+		mcp.WithString("relativeTo",
+			mcp.Description("'selection' (default: union of nodeIds) or a node ID to align against"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		raw, _ := req.Params.Arguments["nodeIds"].([]interface{})
+		resp, err := node.Send(ctx, fileArg(req), "align_nodes", toStringSlice(raw), paramsFrom(req, "mode", "relativeTo"))
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("distribute_nodes",
+		withFile(),
+		mcp.WithDescription("Distribute nodes along an axis: with `spacing`, fixed gaps are applied sequentially from the "+
+			"first node; without it, the current span is divided into equal gaps. Same guards as align_nodes — nodes inside "+
+			"auto-layout parents, inside instances, or under rotated ancestors are skipped with per-node errors. "+
+			"Returns the target absolute placement per node."),
+		mcp.WithArray("nodeIds",
+			mcp.Required(),
+			mcp.Description("Node IDs to distribute (at least 2), colon format"),
+		),
+		mcp.WithString("axis",
+			mcp.Required(),
+			mcp.Enum("horizontal", "vertical"),
+			mcp.Description("Axis to distribute along"),
+		),
+		mcp.WithNumber("spacing",
+			mcp.Description("Fixed gap in px between nodes; omit for equal gaps across the current span"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		raw, _ := req.Params.Arguments["nodeIds"].([]interface{})
+		resp, err := node.Send(ctx, fileArg(req), "distribute_nodes", toStringSlice(raw), paramsFrom(req, "axis", "spacing"))
+		return renderResponse(resp, err)
+	})
+
+	s.AddTool(mcp.NewTool("auto_layout",
+		withFile(),
+		mcp.WithDescription("Stack nodes into auto layout in visual order (vertical: by y then x; horizontal: by x then y): "+
+			"either reparent `nodeIds` into a new frame positioned at their absolute union, or convert an existing `frameId` "+
+			"and reorder its children. Sets direction, spacing, padding (single number or {top,right,bottom,left}) and hug "+
+			"sizing on the frame. Refuses nodes inside instances (edit the main component). Afterwards do not set x/y on the "+
+			"children — Figma silently ignores it; use place_node order/`after` plus the stack's spacing and padding."),
+		mcp.WithArray("nodeIds",
+			mcp.Description("Nodes to stack, colon format; or pass frameId to reuse an existing frame's children"),
+		),
+		mcp.WithString("frameId",
+			mcp.Description("Existing frame to convert into the stack (its children are reordered visually)"),
+		),
+		mcp.WithString("direction",
+			mcp.Required(),
+			mcp.Enum("horizontal", "vertical"),
+			mcp.Description("Stack direction"),
+		),
+		mcp.WithNumber("spacing",
+			mcp.Description("Gap between children in px (default 24)"),
+		),
+		mcp.WithObject("padding",
+			mcp.Properties(map[string]interface{}{
+				"top":    map[string]interface{}{"type": "number", "description": "Top padding in px"},
+				"right":  map[string]interface{}{"type": "number", "description": "Right padding in px"},
+				"bottom": map[string]interface{}{"type": "number", "description": "Bottom padding in px"},
+				"left":   map[string]interface{}{"type": "number", "description": "Left padding in px"},
+			}),
+			mcp.Description("Padding in px: a single number or {top, right, bottom, left} (default 24)"),
+		),
+		mcp.WithString("hug",
+			mcp.Enum("none", "horizontal", "vertical", "both"),
+			mcp.Description("Which axes hug their content (default 'none' = fixed at the current size)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		raw, _ := req.Params.Arguments["nodeIds"].([]interface{})
+		resp, err := node.Send(ctx, fileArg(req), "auto_layout", toStringSlice(raw),
+			paramsFrom(req, "frameId", "direction", "spacing", "padding", "hug"))
+		return renderResponse(resp, err)
+	})
+
 	// ── Write ────────────────────────────────────────────────────────────
 
 	s.AddTool(mcp.NewTool("execute_code",
@@ -311,6 +493,18 @@ func withFile() mcp.ToolOption {
 func fileArg(req mcp.CallToolRequest) string {
 	file, _ := req.Params.Arguments["file"].(string)
 	return strings.TrimSpace(file)
+}
+
+// paramsFrom copies the named request arguments (when present) into a params
+// map, forwarding nested objects and arrays untouched.
+func paramsFrom(req mcp.CallToolRequest, names ...string) map[string]interface{} {
+	params := map[string]interface{}{}
+	for _, name := range names {
+		if v, ok := req.Params.Arguments[name]; ok && v != nil {
+			params[name] = v
+		}
+	}
+	return params
 }
 
 // makeHandler creates a simple tool handler with no parameters.

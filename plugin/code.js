@@ -549,6 +549,354 @@ const handleRequest = async (request) => {
         return { type: request.type, requestId: request.requestId, data: data };
       }
 
+      case "set_text": {
+        const nodeId = (request.nodeIds && request.nodeIds[0]) || (request.params && request.params.nodeId);
+        if (!nodeId) throw new Error("nodeId is required for set_text");
+        const node = await figma.getNodeByIdAsync(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        if (node.type !== "TEXT") throw new Error(`Node ${nodeId} is ${node.type}, not TEXT`);
+        const params = request.params || {};
+        // Load every font the text currently uses (plus the override) before writing anything.
+        const fonts = [];
+        if (isMixed(node.fontName)) {
+          fonts.push(...node.getRangeAllFontNames(0, node.characters.length));
+        } else if (node.fontName) {
+          fonts.push(node.fontName);
+        }
+        const overrideFont = params.fontName && typeof params.fontName === "object" ? params.fontName : null;
+        if (overrideFont) {
+          if (!overrideFont.family || !overrideFont.style) throw new Error("fontName requires {family, style}");
+          fonts.push({ family: overrideFont.family, style: overrideFont.style });
+        }
+        const seenFonts = new Set();
+        const uniqueFonts = fonts.filter((font) => {
+          const key = `${font.family}:${font.style}`;
+          if (seenFonts.has(key)) return false;
+          seenFonts.add(key);
+          return true;
+        });
+        await Promise.all(uniqueFonts.map((font) => figma.loadFontAsync(font)));
+        // Safe order: font and style before characters.
+        if (overrideFont) node.fontName = { family: overrideFont.family, style: overrideFont.style };
+        if (params.fontSize != null) {
+          if (typeof params.fontSize !== "number") throw new Error("fontSize must be a number");
+          node.fontSize = params.fontSize;
+        }
+        if (params.characters != null) node.characters = params.characters;
+        if (params.textAlignHorizontal) node.textAlignHorizontal = params.textAlignHorizontal;
+        if (params.textAutoResize) node.textAutoResize = params.textAutoResize;
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            id: node.id,
+            name: node.name,
+            characters: node.characters,
+            fontSize: isMixed(node.fontSize) ? "mixed" : round2(node.fontSize),
+            fontName: isMixed(node.fontName) ? "mixed" : node.fontName,
+            textAutoResize: node.textAutoResize,
+            bounds: {
+              x: round2(node.x),
+              y: round2(node.y),
+              width: round2(node.width),
+              height: round2(node.height),
+            },
+          },
+        };
+      }
+
+      case "place_node": {
+        const nodeId = (request.nodeIds && request.nodeIds[0]) || (request.params && request.params.nodeId);
+        if (!nodeId) throw new Error("nodeId is required for place_node");
+        const node = await figma.getNodeByIdAsync(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        const params = request.params || {};
+        const parent = params.parentId ? await figma.getNodeByIdAsync(params.parentId) : node.parent;
+        if (!parent || parent.type === "DOCUMENT") {
+          throw new Error(`Parent not found: ${params.parentId || "(node has no parent)"}`);
+        }
+        if (!("appendChild" in parent)) throw new Error(`Parent ${parent.id} (${parent.type}) cannot have children`);
+        // Never write inside an instance: edit the main component instead.
+        const nodeInstanceError = instanceChainError(node, false);
+        if (nodeInstanceError) throw nodeInstanceError;
+        const parentInstanceError = instanceChainError(parent, true);
+        if (parentInstanceError) throw parentInstanceError;
+
+        if ("layoutMode" in parent && parent.layoutMode !== "NONE") {
+          // Auto-layout parent: setting x/y is silently ignored, so only order and parent alignment apply.
+          const otherChildren = parent.children.filter((child) => child.id !== node.id);
+          if (params.align && otherChildren.length > 0) {
+            throw new Error("per-child alignment inside auto-layout needs a nested frame (parent has other children)");
+          }
+          let afterIndex = -1;
+          if (params.after) {
+            const afterNode = await figma.getNodeByIdAsync(params.after);
+            if (!afterNode) throw new Error(`after node not found: ${params.after}`);
+            afterIndex = parent.children.findIndex((child) => child.id === afterNode.id);
+            if (afterIndex === -1) throw new Error(`after node ${params.after} is not a child of ${parent.id}`);
+          }
+          if (node.parent && node.parent.id !== parent.id) parent.appendChild(node);
+          if (afterIndex >= 0) parent.insertChild(afterIndex + 1, node);
+          else parent.appendChild(node);
+          let mode = "auto-layout";
+          if (params.align) {
+            const counterAxis = ALIGN_TO_COUNTER_AXIS[params.align];
+            if (!counterAxis) throw new Error(`Invalid align mode: ${params.align}`);
+            parent.counterAxisAlignItems = counterAxis;
+            mode = "parent-align";
+          }
+          return {
+            type: request.type,
+            requestId: request.requestId,
+            data: {
+              id: node.id,
+              parentId: parent.id,
+              mode,
+              index: parent.children.findIndex((child) => child.id === node.id),
+              note: "auto-layout parent: x/y are ignored; position comes from child order, spacing and padding",
+            },
+          };
+        }
+
+        // Absolute parent: x/y work, so convert the requested placement to parent-local.
+        if (params.align && !("width" in parent)) {
+          throw new Error(`align needs a frame parent with bounds, not a ${parent.type}`);
+        }
+        const snap = params.snap != null ? params.snap : 8;
+        let target = null;
+        if (params.position && typeof params.position === "object") {
+          target = absToParentLocal(parent, Number(params.position.x), Number(params.position.y));
+        } else if (params.relative && typeof params.relative === "object") {
+          target = { x: Number(params.relative.x), y: Number(params.relative.y) };
+        } else if (params.align) {
+          target = alignWithinParent(parent, node, params.align);
+        }
+        if (target && (!isFinite(target.x) || !isFinite(target.y))) {
+          throw new Error("position/relative must be finite {x, y} numbers");
+        }
+        if (params.parentId && node.parent && node.parent.id !== parent.id) parent.appendChild(node);
+        if (target) {
+          const snapped = { x: snapValue(target.x, snap), y: snapValue(target.y, snap) };
+          node.x = snapped.x;
+          node.y = snapped.y;
+          return {
+            type: request.type,
+            requestId: request.requestId,
+            data: {
+              id: node.id,
+              parentId: parent.id,
+              mode: "absolute",
+              x: round2(snapped.x),
+              y: round2(snapped.y),
+              snappedFrom: { x: round2(target.x), y: round2(target.y) },
+              snap,
+            },
+          };
+        }
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            id: node.id,
+            parentId: parent.id,
+            mode: "absolute",
+            x: round2(node.x),
+            y: round2(node.y),
+            snappedFrom: { x: round2(node.x), y: round2(node.y) },
+            snap,
+          },
+        };
+      }
+
+      case "align_nodes": {
+        const params = request.params || {};
+        if (!ALIGN_MODES.includes(params.mode)) {
+          throw new Error(`mode is required for align_nodes (${ALIGN_MODES.join("|")})`);
+        }
+        const nodes = await resolveNodes(requestNodeIds(request));
+        const boxes = nodes.map((node) => absBox(node));
+        let reference;
+        if (params.relativeTo && params.relativeTo !== "selection") {
+          const refNode = await figma.getNodeByIdAsync(params.relativeTo);
+          if (!refNode) throw new Error(`relativeTo node not found: ${params.relativeTo}`);
+          reference = absBox(refNode);
+        } else {
+          reference = unionBoxes(boxes);
+        }
+        const results = nodes.map((node, i) => {
+          const target = alignTarget(boxes[i], reference, params.mode);
+          return applyGuardedDelta(node, target.x - boxes[i].x, target.y - boxes[i].y);
+        });
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            results,
+            reference: {
+              x: round2(reference.x),
+              y: round2(reference.y),
+              width: round2(reference.width),
+              height: round2(reference.height),
+            },
+          },
+        };
+      }
+
+      case "distribute_nodes": {
+        const params = request.params || {};
+        if (params.axis !== "horizontal" && params.axis !== "vertical") {
+          throw new Error('axis is required for distribute_nodes ("horizontal"|"vertical")');
+        }
+        const nodes = await resolveNodes(requestNodeIds(request));
+        if (nodes.length < 2) throw new Error("distribute_nodes needs at least 2 nodes");
+        const horizontal = params.axis === "horizontal";
+        const entries = nodes
+          .map((node) => ({ node, box: absBox(node) }))
+          .sort((a, b) => (horizontal ? a.box.x - b.box.x : a.box.y - b.box.y));
+        const lead = (box) => (horizontal ? box.x : box.y);
+        const size = (box) => (horizontal ? box.width : box.height);
+        const spanStart = lead(entries[0].box);
+        const last = entries[entries.length - 1].box;
+        const spanEnd = lead(last) + size(last);
+        let gap;
+        if (params.spacing != null) {
+          gap = Number(params.spacing);
+        } else {
+          const totalSize = entries.reduce((sum, entry) => sum + size(entry.box), 0);
+          gap = (spanEnd - spanStart - totalSize) / (entries.length - 1);
+        }
+        let cursor = spanStart;
+        const results = entries.map((entry) => {
+          const targetLead = cursor;
+          cursor = targetLead + size(entry.box) + gap;
+          const dx = horizontal ? targetLead - entry.box.x : 0;
+          const dy = horizontal ? 0 : targetLead - entry.box.y;
+          const move = applyGuardedDelta(entry.node, dx, dy);
+          return Object.assign(move, {
+            x: round2(horizontal ? targetLead : entry.box.x),
+            y: round2(horizontal ? entry.box.y : targetLead),
+          });
+        });
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            axis: params.axis,
+            spacing: params.spacing != null ? Number(params.spacing) : "even",
+            gap: round2(gap),
+            results,
+          },
+        };
+      }
+
+      case "auto_layout": {
+        const params = request.params || {};
+        if (params.direction !== "horizontal" && params.direction !== "vertical") {
+          throw new Error('direction is required for auto_layout ("horizontal"|"vertical")');
+        }
+        const hug = params.hug || "none";
+        if (!HUG_MODES.includes(hug)) throw new Error(`Invalid hug: ${params.hug} (${HUG_MODES.join("|")})`);
+        let frame = null;
+        if (params.frameId) {
+          frame = await figma.getNodeByIdAsync(params.frameId);
+          if (!frame) throw new Error(`Frame not found: ${params.frameId}`);
+          if (!("layoutMode" in frame)) throw new Error(`frameId ${frame.id} is a ${frame.type}, not a frame`);
+          const frameInstanceError = instanceChainError(frame, true);
+          if (frameInstanceError) throw frameInstanceError;
+        }
+        const ids = requestNodeIds(request);
+        const nodes = ids.length > 0 ? await resolveNodes(ids) : [];
+        if (nodes.length === 0 && (!frame || frame.children.length === 0)) {
+          throw new Error("No nodes to lay out: pass nodeIds or frameId");
+        }
+        const sourceNodes = nodes.length > 0 ? nodes : frame.children.slice();
+        // Never pull nodes out of an instance: edit the main component instead.
+        for (const sourceNode of sourceNodes) {
+          if (frame && sourceNode.id === frame.id) throw new Error(`Cannot place frame ${frame.id} inside itself`);
+          const instanceError = instanceChainError(sourceNode, false);
+          if (instanceError) throw instanceError;
+        }
+        // Visual order: vertical stacks read top-to-bottom, horizontal left-to-right.
+        const ordered = sourceNodes
+          .map((node) => ({ node, box: absBox(node) }))
+          .sort((a, b) =>
+            params.direction === "vertical"
+              ? (a.box.y - b.box.y) || (a.box.x - b.box.x)
+              : (a.box.x - b.box.x) || (a.box.y - b.box.y)
+          )
+          .map((entry) => entry.node);
+        const union = unionBoxes(ordered.map((node) => absBox(node)));
+        if (!frame) {
+          frame = figma.createFrame();
+          frame.fills = [];
+          frame.x = union.x;
+          frame.y = union.y;
+          frame.resize(Math.max(union.width, 0.01), Math.max(union.height, 0.01));
+        }
+        for (const node of ordered) {
+          const box = absBox(node);
+          frame.appendChild(node);
+          // Keep each node at its absolute position while reparenting.
+          node.x = box.x - frame.x;
+          node.y = box.y - frame.y;
+        }
+        frame.layoutMode = params.direction === "vertical" ? "VERTICAL" : "HORIZONTAL";
+        frame.itemSpacing = params.spacing != null ? params.spacing : 24;
+        const padding = params.padding != null ? params.padding : 24;
+        if (typeof padding === "number") {
+          frame.paddingTop = padding;
+          frame.paddingRight = padding;
+          frame.paddingBottom = padding;
+          frame.paddingLeft = padding;
+        } else if (padding && typeof padding === "object") {
+          frame.paddingTop = paddingNumber(padding.top);
+          frame.paddingRight = paddingNumber(padding.right);
+          frame.paddingBottom = paddingNumber(padding.bottom);
+          frame.paddingLeft = paddingNumber(padding.left);
+        }
+        const hugPrimary =
+          params.direction === "vertical"
+            ? hug === "vertical" || hug === "both"
+            : hug === "horizontal" || hug === "both";
+        const hugCounter =
+          params.direction === "vertical"
+            ? hug === "horizontal" || hug === "both"
+            : hug === "vertical" || hug === "both";
+        frame.primaryAxisSizingMode = hugPrimary ? "AUTO" : "FIXED";
+        frame.counterAxisSizingMode = hugCounter ? "AUTO" : "FIXED";
+        if (!hugPrimary || !hugCounter) {
+          // "none" keeps the current size: re-assert it after switching off hug.
+          frame.resize(Math.max(frame.width, 0.01), Math.max(frame.height, 0.01));
+        }
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            frameId: frame.id,
+            name: frame.name,
+            childOrder: frame.children.map((child) => child.id),
+            layout: {
+              mode: frame.layoutMode,
+              spacing: frame.itemSpacing,
+              padding: {
+                top: frame.paddingTop,
+                right: frame.paddingRight,
+                bottom: frame.paddingBottom,
+                left: frame.paddingLeft,
+              },
+              primarySizing: frame.primaryAxisSizingMode,
+              counterSizing: frame.counterAxisSizingMode,
+            },
+            bounds: {
+              x: round2(frame.x),
+              y: round2(frame.y),
+              width: round2(frame.width),
+              height: round2(frame.height),
+            },
+          },
+        };
+      }
+
       default:
         throw new Error(`Unknown request type: ${request.type}`);
     }
@@ -586,3 +934,146 @@ figma.ui.onmessage = async (message) => {
     }
   }
 };
+
+// ── Write helpers ─────────────────────────────────────────────────────
+
+const ALIGN_MODES = ["left", "hcenter", "right", "top", "vcenter", "bottom"];
+const HUG_MODES = ["none", "horizontal", "vertical", "both"];
+const ALIGN_TO_COUNTER_AXIS = {
+  left: "MIN",
+  hcenter: "CENTER",
+  right: "MAX",
+  top: "MIN",
+  vcenter: "CENTER",
+  bottom: "MAX",
+};
+
+const round2 = (value) => (typeof value === "number" && isFinite(value) ? Math.round(value * 100) / 100 : value);
+
+const requestNodeIds = (request) => {
+  if (request.nodeIds && request.nodeIds.length > 0) return request.nodeIds;
+  const fromParams = request.params && request.params.nodeIds;
+  return Array.isArray(fromParams) ? fromParams : [];
+};
+
+// Returns the INSTANCE the given node lives in, or null. includeSelf lets a
+// target parent be rejected when it is the instance itself.
+const instanceAncestor = (node, includeSelf) => {
+  let current = includeSelf ? node : node.parent;
+  while (current && current.type !== "DOCUMENT") {
+    if (current.type === "INSTANCE") return current;
+    current = current.parent;
+  }
+  return null;
+};
+
+const instanceChainError = (node, includeSelf) => {
+  const instance = instanceAncestor(node, includeSelf);
+  if (!instance) return null;
+  const mainComponent = instance.mainComponent ? instance.mainComponent.id : "unknown";
+  return new Error(
+    `Node ${node.id} is inside instance ${instance.id} (main component ${mainComponent}): edit the main component instead`
+  );
+};
+
+const findRotatedAncestor = (node) => {
+  let current = node.parent;
+  while (current && current.type !== "DOCUMENT") {
+    if ("rotation" in current && typeof current.rotation === "number" && Math.abs(current.rotation) > 1e-9) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+};
+
+// Absolute page coordinates → parent-local, via the parent's absoluteTransform
+// inverse (never naive subtraction: rotated/translated parents break it).
+const absToParentLocal = (parent, x, y) => {
+  const t =
+    "absoluteTransform" in parent && parent.absoluteTransform
+      ? parent.absoluteTransform
+      : { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+  const det = t.a * t.d - t.b * t.c;
+  if (det === 0) throw new Error(`Parent ${parent.id} has a degenerate transform (det = 0)`);
+  return {
+    x: (t.d * (x - t.e) - t.c * (y - t.f)) / det,
+    y: (-t.b * (x - t.e) + t.a * (y - t.f)) / det,
+  };
+};
+
+const snapValue = (value, snap) => (typeof snap === "number" && snap > 0 ? Math.round(value / snap) * snap : value);
+
+const absBox = (node) => {
+  const box = node.absoluteBoundingBox;
+  if (!box) throw new Error(`Node ${node.id} (${node.type}) has no absolute bounding box`);
+  return box;
+};
+
+const unionBoxes = (boxes) => {
+  const minX = Math.min(...boxes.map((box) => box.x));
+  const minY = Math.min(...boxes.map((box) => box.y));
+  const maxX = Math.max(...boxes.map((box) => box.x + box.width));
+  const maxY = Math.max(...boxes.map((box) => box.y + box.height));
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+};
+
+// Align one box edge/center to a reference box; only the relevant axis moves.
+const alignTarget = (box, reference, mode) => {
+  switch (mode) {
+    case "left": return { x: reference.x, y: box.y };
+    case "hcenter": return { x: reference.x + reference.width / 2 - box.width / 2, y: box.y };
+    case "right": return { x: reference.x + reference.width - box.width, y: box.y };
+    case "top": return { x: box.x, y: reference.y };
+    case "vcenter": return { x: box.x, y: reference.y + reference.height / 2 - box.height / 2 };
+    case "bottom": return { x: box.x, y: reference.y + reference.height - box.height };
+    default: throw new Error(`Invalid align mode: ${mode}`);
+  }
+};
+
+// Align inside a plain parent's content box (bounds minus paddings), parent-local.
+const alignWithinParent = (parent, node, align) => {
+  const paddingLeft = "paddingLeft" in parent ? parent.paddingLeft : 0;
+  const paddingTop = "paddingTop" in parent ? parent.paddingTop : 0;
+  const paddingRight = "paddingRight" in parent ? parent.paddingRight : 0;
+  const paddingBottom = "paddingBottom" in parent ? parent.paddingBottom : 0;
+  const contentWidth = parent.width - paddingLeft - paddingRight;
+  const contentHeight = parent.height - paddingTop - paddingBottom;
+  switch (align) {
+    case "left": return { x: paddingLeft, y: node.y };
+    case "hcenter": return { x: paddingLeft + (contentWidth - node.width) / 2, y: node.y };
+    case "right": return { x: parent.width - paddingRight - node.width, y: node.y };
+    case "top": return { x: node.x, y: paddingTop };
+    case "vcenter": return { x: node.x, y: paddingTop + (contentHeight - node.height) / 2 };
+    case "bottom": return { x: node.x, y: parent.height - paddingBottom - node.height };
+    default: throw new Error(`Invalid align mode: ${align}`);
+  }
+};
+
+const resolveNodes = async (ids) => {
+  if (!Array.isArray(ids) || ids.length === 0) throw new Error("nodeIds is required");
+  const nodes = await Promise.all(ids.map((id) => figma.getNodeByIdAsync(id)));
+  nodes.forEach((node, i) => {
+    if (!node) throw new Error(`Node not found: ${ids[i]}`);
+  });
+  return nodes;
+};
+
+// Apply an absolute (dx, dy) as a local delta, with the write guardrails:
+// auto-layout parents, instance descendants and rotated ancestors are refused
+// per node instead of silently misplacing (or ignoring) the move.
+const applyGuardedDelta = (node, dx, dy) => {
+  const failure = (error) => ({ id: node.id, applied: false, dx: round2(dx), dy: round2(dy), error });
+  if (!node.parent) return failure("node has no parent");
+  if ("layoutMode" in node.parent && node.parent.layoutMode !== "NONE") {
+    return failure("inside auto-layout parent: use order/padding");
+  }
+  const instanceError = instanceChainError(node, false);
+  if (instanceError) return failure(instanceError.message);
+  if (findRotatedAncestor(node)) return failure("rotated ancestor — manual handling needed");
+  node.x += dx;
+  node.y += dy;
+  return { id: node.id, applied: true, dx: round2(dx), dy: round2(dy) };
+};
+
+const paddingNumber = (value) => (typeof value === "number" && isFinite(value) ? value : 0);
