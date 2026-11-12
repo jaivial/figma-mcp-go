@@ -119,6 +119,21 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		return renderResponse(resp, err)
 	})
 
+	s.AddTool(mcp.NewTool("get_layout_context",
+		withFile(),
+		mcp.WithDescription("Everything needed to place/align inside or next to a node WITHOUT guessing: "+
+			"parent layout mode (auto-layout vs absolute), sibling geometry, free space, page grid, and explicit hints. "+
+			"Call this BEFORE moving/creating nodes near existing content — the #1 cause of misplaced frames is ignoring the parent's auto-layout."),
+		mcp.WithString("nodeId",
+			mcp.Required(),
+			mcp.Description("Node ID, colon format e.g. '4029:12345' or instance 'I80:165050;80:162650'"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		nodeID, _ := req.Params.Arguments["nodeId"].(string)
+		resp, err := node.Send(ctx, fileArg(req), "get_layout_context", nil, map[string]interface{}{"nodeId": nodeID})
+		return renderResponse(resp, err)
+	})
+
 	s.AddTool(mcp.NewTool("scan_text_nodes",
 		withFile(),
 		mcp.WithDescription("Scan all TEXT nodes in a subtree. Useful for extracting all copy from a component or frame."),

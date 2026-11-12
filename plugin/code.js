@@ -2,6 +2,25 @@
 
 const isMixed = (value) => typeof value === "symbol";
 
+const round2 = (value) => {
+  if (typeof value === "number") return Math.round(value * 100) / 100;
+  return isMixed(value) ? "mixed" : value;
+};
+
+const toRect = (rect) =>
+  rect ? { x: round2(rect.x), y: round2(rect.y), width: round2(rect.width), height: round2(rect.height) } : null;
+
+const toLineHeight = (value) => {
+  if (isMixed(value)) return "mixed";
+  if (typeof value === "number") return round2(value);
+  if (value && typeof value === "object") {
+    const out = { unit: value.unit };
+    if (typeof value.value === "number") out.value = round2(value.value);
+    return out;
+  }
+  return undefined;
+};
+
 const toHex = (color) => {
   const clamp = (v) => Math.min(255, Math.max(0, Math.round(v * 255)));
   const [r, g, b] = [clamp(color.r), clamp(color.g), clamp(color.b)];
@@ -23,7 +42,7 @@ const serializePaints = (paints) => {
 
 const getBounds = (node) => {
   if ("x" in node && "y" in node && "width" in node && "height" in node) {
-    return { x: node.x, y: node.y, width: node.width, height: node.height };
+    return { x: round2(node.x), y: round2(node.y), width: round2(node.width), height: round2(node.height) };
   }
   return undefined;
 };
@@ -44,6 +63,57 @@ const serializeStyles = (node) => {
     };
   }
   return styles;
+};
+
+// Layout model of a node: auto-layout settings, constraints, absolute geometry.
+// Keys that do not apply to the node type are omitted.
+const serializeLayout = (node) => {
+  const layout = {};
+  const set = (key, value) => {
+    if (value !== undefined) layout[key] = value;
+  };
+
+  if (node.type === "FRAME" || node.type === "COMPONENT" || node.type === "INSTANCE") {
+    set("layoutMode", node.layoutMode);
+    set("itemSpacing", round2(node.itemSpacing));
+    set("layoutWrap", node.layoutWrap);
+    set("paddingTop", round2(node.paddingTop));
+    set("paddingRight", round2(node.paddingRight));
+    set("paddingBottom", round2(node.paddingBottom));
+    set("paddingLeft", round2(node.paddingLeft));
+    set("primaryAxisAlignItems", node.primaryAxisAlignItems);
+    set("counterAxisAlignItems", node.counterAxisAlignItems);
+    set("primaryAxisSizingMode", node.primaryAxisSizingMode);
+    set("counterAxisSizingMode", node.counterAxisSizingMode);
+    set("clipsContent", node.clipsContent);
+  }
+
+  if ("constraints" in node && node.constraints) {
+    set("constraints", { horizontal: node.constraints.horizontal, vertical: node.constraints.vertical });
+  }
+
+  if (node.type === "TEXT") {
+    set("textAutoResize", node.textAutoResize);
+    set("lineHeight", toLineHeight(node.lineHeight));
+    set("letterSpacing", round2(node.letterSpacing));
+  }
+
+  if (typeof node.rotation === "number" && node.rotation !== 0) {
+    set("rotation", round2(node.rotation));
+  }
+
+  set("absoluteBoundingBox", toRect(node.absoluteBoundingBox));
+  set("absoluteRenderBounds", toRect(node.absoluteRenderBounds));
+  set("parentId", node.parent ? node.parent.id : undefined);
+  set("childCount", node.children ? node.children.length : undefined);
+  // True when x/y writes on this node are ignored because the parent runs auto-layout.
+  if (node.parent && node.parent.layoutMode && node.parent.layoutMode !== "NONE") {
+    layout.parentAutoLayout = true;
+  }
+  if (node.type === "INSTANCE" && node.mainComponent) {
+    layout.mainComponent = { id: node.mainComponent.id, name: node.mainComponent.name };
+  }
+  return layout;
 };
 
 const serializeText = (node, base) => {
@@ -69,8 +139,11 @@ const serializeNode = (node) => {
     name: node.name,
     type: node.type,
     bounds: getBounds(node),
-    styles: serializeStyles(node),
   };
+  const styles = serializeStyles(node);
+  if (Object.keys(styles).length > 0) base.styles = styles;
+  const layout = serializeLayout(node);
+  if (Object.keys(layout).length > 0) base.layout = layout;
   if (node.type === "TEXT") return serializeText(node, base);
   if ("children" in node) {
     return Object.assign({}, base, { children: node.children.map((child) => serializeNode(child)) });
@@ -188,6 +261,110 @@ const handleRequest = async (request) => {
             currentPage: { id: figma.currentPage.id, name: figma.currentPage.name },
             selectionCount: selection.length,
             context: contextNodes,
+          },
+        };
+      }
+
+      case "get_layout_context": {
+        const nodeId = request.params && request.params.nodeId;
+        if (!nodeId) throw new Error("nodeId is required for get_layout_context");
+        const node = await figma.getNodeByIdAsync(nodeId);
+        if (!node) throw new Error(`Node not found: ${nodeId}`);
+        if (node.type === "PAGE" || node.type === "DOCUMENT") {
+          throw new Error(`nodeId must be a scene node, not ${node.type}: ${nodeId}`);
+        }
+        const parent = node.parent;
+        const autoLayout = (n) => n.layoutMode === "VERTICAL" || n.layoutMode === "HORIZONTAL";
+        const nodeBounds = getBounds(node);
+        const parentBounds = parent ? getBounds(parent) : undefined;
+
+        // Sibling geometry in reading order along the parent's main axis.
+        const siblings = parent && parent.children
+          ? parent.children
+              .filter((child) => child.id !== node.id)
+              .map((child) => ({
+                id: child.id,
+                name: child.name,
+                type: child.type,
+                x: round2(child.x),
+                y: round2(child.y),
+                width: round2(child.width),
+                height: round2(child.height),
+              }))
+          : [];
+        if (parent && parent.layoutMode === "HORIZONTAL") {
+          siblings.sort((a, b) => a.x - b.x);
+        } else if (parent && parent.layoutMode === "VERTICAL") {
+          siblings.sort((a, b) => a.y - b.y);
+        } else {
+          siblings.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+        }
+
+        // Gap from the node box to the parent content box (bounds minus padding),
+        // only meaningful when the parent positions children absolutely.
+        let free = null;
+        if (parent && !autoLayout(parent) && parentBounds && nodeBounds) {
+          free = {
+            left: round2(nodeBounds.x - (parentBounds.x + (parent.paddingLeft || 0))),
+            top: round2(nodeBounds.y - (parentBounds.y + (parent.paddingTop || 0))),
+            right: round2(parentBounds.x + parentBounds.width - (parent.paddingRight || 0) - (nodeBounds.x + nodeBounds.width)),
+            bottom: round2(parentBounds.y + parentBounds.height - (parent.paddingBottom || 0) - (nodeBounds.y + nodeBounds.height)),
+          };
+        }
+
+        const summarizeGrid = (grid) => {
+          const summary = { pattern: grid.pattern };
+          if ("patternType" in grid) summary.patternType = grid.patternType;
+          if ("sectionSize" in grid) summary.sectionSize = round2(grid.sectionSize);
+          if (grid.pattern !== "GRID") {
+            if ("alignment" in grid) summary.alignment = grid.alignment;
+            if ("gutterSize" in grid) summary.gutterSize = round2(grid.gutterSize);
+            if ("count" in grid) {
+              if (grid.pattern === "ROWS") summary.rowCount = grid.count;
+              else summary.columnCount = grid.count;
+            }
+          }
+          return summary;
+        };
+        const grids = Array.isArray(figma.currentPage.layoutGrids)
+          ? figma.currentPage.layoutGrids.map(summarizeGrid)
+          : [];
+
+        const hints = [];
+        if (parent && autoLayout(parent)) {
+          hints.push("parent uses auto-layout: control position via order+padding+itemSpacing; child x/y are silently ignored");
+        }
+        if (grids.length > 0) hints.push("page uses a layout grid: snap coordinates to it");
+        if (node.type === "TEXT" && node.textAutoResize && node.textAutoResize !== "NONE") {
+          hints.push("textAutoResize differs from NONE: resize() semantics differ");
+        }
+        if (parent && parent.clipsContent === true) hints.push("parent clips overflow");
+
+        return {
+          type: request.type,
+          requestId: request.requestId,
+          data: {
+            nodeId: node.id,
+            name: node.name,
+            type: node.type,
+            bounds: nodeBounds,
+            absoluteBoundingBox: toRect(node.absoluteBoundingBox),
+            absoluteRenderBounds: toRect(node.absoluteRenderBounds),
+            layout: serializeLayout(node),
+            parent: parent
+              ? {
+                  id: parent.id,
+                  name: parent.name,
+                  type: parent.type,
+                  bounds: parentBounds,
+                  layout: serializeLayout(parent),
+                  childCount: parent.children ? parent.children.length : 0,
+                }
+              : null,
+            siblings,
+            free,
+            grid: grids,
+            hints,
           },
         };
       }
