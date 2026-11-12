@@ -2219,7 +2219,8 @@ const exportAbsoluteClasses = (node) => {
 // fontName.style → weight class (SemiBold must be checked before Bold).
 const exportWeightClass = (style) => {
   if (typeof style !== "string") return null;
-  if (/semibold/i.test(style)) return "font-semibold";
+  // Figma's style string is "Semi Bold" (with a space) — tolerate all spellings.
+  if (/semi[\s-]?bold/i.test(style)) return "font-semibold";
   if (/bold/i.test(style)) return "font-bold";
   if (/medium/i.test(style)) return "font-medium";
   return null;
