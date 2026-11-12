@@ -392,6 +392,27 @@ func RegisterTools(s *server.MCPServer, node *Node) {
 		return executeSaveScreenshots(ctx, node, req)
 	})
 
+	s.AddTool(mcp.NewTool("capture_review",
+		withFile(),
+		mcp.WithDescription("Screenshot a node to disk AND return its layout context + text inventory + a visual-review checklist in one call — everything a vision agent needs to review a design without extra round-trips. Write findings with annotate_finding, fix with place_node/align_nodes/auto_layout/set_text, then capture_review again to a NEW file and compare before/after."),
+		mcp.WithString("nodeId",
+			mcp.Required(),
+			mcp.Description("Node to capture, colon format e.g. '4029:12345'"),
+		),
+		mcp.WithString("outputPath",
+			mcp.Required(),
+			mcp.Description("Relative path for the PNG, inside the working directory, must not already exist (e.g. .figma-shots/review-1.png)"),
+		),
+		mcp.WithNumber("scale",
+			mcp.Description("Export scale for the PNG (default 1)"),
+		),
+		mcp.WithNumber("contextDepth",
+			mcp.Description("How many levels of surrounding layout to include in the context (default 2)"),
+		),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return ExecuteCaptureReview(ctx, node, req)
+	})
+
 	// ── Layout writes ────────────────────────────────────────────────────
 
 	s.AddTool(mcp.NewTool("set_text",
@@ -748,6 +769,33 @@ func RegisterPrompts(s *server.MCPServer) {
    only as final visual confirmation
 6. Hygiene: name layers, remove probe nodes in the same call, keep Light/Dark + breakpoint
    twin frames in sync, edit main components (not instances) for design-system changes`),
+				),
+			},
+		), nil
+	})
+
+	s.AddPrompt(mcp.NewPrompt("visual_review_strategy",
+		mcp.WithPromptDescription("Protocol for visually reviewing a Figma design with figma-mcp-go: capture, review, fix, re-capture"),
+	), func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		return mcp.NewGetPromptResult(
+			"Visual review protocol for Figma designs",
+			[]mcp.PromptMessage{
+				mcp.NewPromptMessage(
+					mcp.RoleUser,
+					mcp.NewTextContent(`Visual review protocol with figma-mcp-go:
+
+0. list_files then select_file so the review targets the right file
+1. capture_review(nodeId, .figma-shots/review-N.png) — one call writes the screenshot
+   to disk and returns the layout context, text inventory, and checklist
+2. Open the PNG and review EVERY checklist item, citing concrete nodes from the
+   layout context and text inventory — never vague impressions
+3. annotate_finding for each issue (severity honest: blocker / major / minor / nit)
+4. Fix with the layout tools: place_node, align_nodes, distribute_nodes, auto_layout,
+   set_text, apply_style
+5. capture_review to a NEW path (.figma-shots/review-(N+1).png) and compare with the
+   previous capture — every finding must be visibly fixed, nothing regressed
+6. validate_layout(nodeId) must end with 0 warnings
+7. Report a findings → fixes → evidence table (before/after capture paths)`),
 				),
 			},
 		), nil
