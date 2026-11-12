@@ -1228,7 +1228,9 @@ const locateUserCodeError = (error, code, preludeLines) => {
   let line = null;
   if (frame) {
     const userLine = parseInt(frame.match(/<anonymous>:(\d+):\d+\)?\s*$/)[1], 10) - 2 - preludeLines;
-    if (userLine >= 1) line = userLine;
+    // Reject lines outside the user code: compile errors surface the new Function
+    // call site inside this plugin file instead of a user line.
+    if (userLine >= 1 && userLine <= code.split("\n").length) line = userLine;
   }
   const codeLines = code.split("\n");
   let codeExcerpt = null;
