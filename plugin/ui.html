@@ -108,7 +108,10 @@
       </div>
     </div>
     <script>
-      var WS_URL = "ws://localhost:1994/ws";
+      var WS_TOKEN = window.__FIGMA_MCP_TOKEN__ || "";
+      var WS_URL =
+        "ws://localhost:1994/ws" +
+        (WS_TOKEN ? "?token=" + encodeURIComponent(WS_TOKEN) : "");
       var RECONNECT_DELAY_MS = 1500;
 
       var socket = null;

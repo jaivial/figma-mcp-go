@@ -5,8 +5,11 @@ import (
 	"regexp"
 )
 
-// nodeIDPattern matches Figma node IDs: colon-separated integers e.g. "4029:12345"
-var nodeIDPattern = regexp.MustCompile(`^\d+:\d+$`)
+// nodeIDPattern matches Figma node IDs: colon-separated integer pairs e.g.
+// "4029:12345". Instance nodes chain their parent IDs with ";" and may carry an
+// "I" prefix on each pair, e.g. "I80:165050;80:162650" — the exact form the
+// plugin serializer returns for children of an instance.
+var nodeIDPattern = regexp.MustCompile(`^I?\d+:\d+(?:;I?\d+:\d+)*$`)
 
 // ValidNodeID reports whether s is a valid Figma node ID.
 func ValidNodeID(s string) bool {
@@ -22,7 +25,7 @@ func ValidateRPC(tool string, nodeIDs []string, params map[string]interface{}) s
 			return "nodeId is required"
 		}
 		if !ValidNodeID(nodeIDs[0]) {
-			return fmt.Sprintf("nodeId must use colon format e.g. 4029:12345, got: %s", nodeIDs[0])
+			return fmt.Sprintf("nodeId must use colon format e.g. 4029:12345 (instance form: I80:165050;80:162650), got: %s", nodeIDs[0])
 		}
 
 	case "get_nodes_info":
@@ -31,14 +34,14 @@ func ValidateRPC(tool string, nodeIDs []string, params map[string]interface{}) s
 		}
 		for _, id := range nodeIDs {
 			if !ValidNodeID(id) {
-				return fmt.Sprintf("invalid nodeId: %s — must use colon format e.g. 4029:12345", id)
+				return fmt.Sprintf("invalid nodeId: %s — must use colon format e.g. 4029:12345 (instance form: I80:165050;80:162650)", id)
 			}
 		}
 
 	case "get_screenshot":
 		for _, id := range nodeIDs {
 			if !ValidNodeID(id) {
-				return fmt.Sprintf("invalid nodeId: %s — must use colon format e.g. 4029:12345", id)
+				return fmt.Sprintf("invalid nodeId: %s — must use colon format e.g. 4029:12345 (instance form: I80:165050;80:162650)", id)
 			}
 		}
 		if format, ok := params["format"].(string); ok {
@@ -63,7 +66,7 @@ func ValidateRPC(tool string, nodeIDs []string, params map[string]interface{}) s
 			}
 			nodeID, _ := m["nodeId"].(string)
 			if !ValidNodeID(nodeID) {
-				return fmt.Sprintf("items[%d].nodeId must use colon format e.g. 4029:12345", i)
+				return fmt.Sprintf("items[%d].nodeId must use colon format e.g. 4029:12345 (instance form: I80:165050;80:162650)", i)
 			}
 			outputPath, _ := m["outputPath"].(string)
 			if outputPath == "" {
@@ -84,7 +87,7 @@ func ValidateRPC(tool string, nodeIDs []string, params map[string]interface{}) s
 			return "nodeId is required"
 		}
 		if !ValidNodeID(nodeID) {
-			return fmt.Sprintf("nodeId must use colon format e.g. 4029:12345, got: %s", nodeID)
+			return fmt.Sprintf("nodeId must use colon format e.g. 4029:12345 (instance form: I80:165050;80:162650), got: %s", nodeID)
 		}
 		if tool == "scan_nodes_by_types" {
 			types, ok := params["types"].([]interface{})

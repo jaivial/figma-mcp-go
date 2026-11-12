@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -80,6 +81,10 @@ func NewBridge() *Bridge {
 // HandleUpgrade upgrades an HTTP request to a WebSocket connection and registers it
 // as one more connected file.
 func (b *Bridge) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
+	if origin := r.Header.Get("Origin"); !originAllowed(origin) {
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true, // plugin connects from localhost
 	})
@@ -104,6 +109,25 @@ func (b *Bridge) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	go b.readLoop(pc)
 	// Works with any plugin version: get_metadata has always been there.
 	go b.identify(context.Background(), pc)
+}
+
+// originAllowed reports whether a browser Origin may open the WebSocket. The
+// plugin UI is hosted on figma.com ("null" shows up for sandboxed iframes), so
+// any other Origin is a different page trying to drive the bridge. Requests
+// without an Origin header (non-browser clients) stay allowed.
+func originAllowed(origin string) bool {
+	if origin == "" || origin == "null" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "figma.com", "www.figma.com":
+		return true
+	}
+	return false
 }
 
 // identify asks the plugin which file it runs in.

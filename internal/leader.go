@@ -27,6 +27,7 @@ type Leader struct {
 	bridge  *Bridge
 	server  *http.Server
 	version string
+	token   string
 }
 
 // NewLeader creates a Leader. Call Start() to bind the port.
@@ -35,6 +36,7 @@ func NewLeader(port int, version string) *Leader {
 		port:    port,
 		bridge:  NewBridge(),
 		version: version,
+		token:   os.Getenv("FIGMA_MCP_TOKEN"),
 	}
 }
 
@@ -46,7 +48,8 @@ func (l *Leader) GetBridge() *Bridge {
 // Start binds the port and begins serving. Returns an error immediately
 // if the port is already in use (EADDRINUSE → caller detects another leader).
 func (l *Leader) Start() error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", l.port))
+	// Loopback only — /rpc drives the plugin, so it must not reach the LAN.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", l.port))
 	if err != nil {
 		return err // includes EADDRINUSE
 	}
@@ -65,7 +68,7 @@ func (l *Leader) Start() error {
 		}
 	}()
 
-	leaderLogger.Printf("listening on :%d", l.port)
+	leaderLogger.Printf("listening on 127.0.0.1:%d", l.port)
 	return nil
 }
 
@@ -98,6 +101,9 @@ func (l *Leader) handleFiles(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !l.requireToken(w, r, false) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"files": l.bridge.Files(r.Context(), true),
@@ -106,6 +112,9 @@ func (l *Leader) handleFiles(w http.ResponseWriter, r *http.Request) {
 
 // handleWS upgrades the connection to WebSocket for the Figma plugin.
 func (l *Leader) handleWS(w http.ResponseWriter, r *http.Request) {
+	if !l.requireToken(w, r, true) {
+		return
+	}
 	l.bridge.HandleUpgrade(w, r)
 }
 
@@ -113,6 +122,9 @@ func (l *Leader) handleWS(w http.ResponseWriter, r *http.Request) {
 func (l *Leader) handleRPC(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !l.requireToken(w, r, false) {
 		return
 	}
 
@@ -150,6 +162,27 @@ func (l *Leader) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	l.sendJSON(w, http.StatusOK, RPCResponse{Data: resp.Data})
+}
+
+// requireToken enforces the opt-in auth token (FIGMA_MCP_TOKEN). When set,
+// /rpc and /files must carry it in the X-Figma-MCP-Token header and /ws as the
+// ?token= query parameter, since browser WebSocket clients cannot set headers.
+// When no token is configured every request is allowed, exactly as before.
+func (l *Leader) requireToken(w http.ResponseWriter, r *http.Request, viaQuery bool) bool {
+	if l.token == "" {
+		return true
+	}
+	got := ""
+	if viaQuery {
+		got = r.URL.Query().Get("token")
+	} else {
+		got = r.Header.Get("X-Figma-MCP-Token")
+	}
+	if got == l.token {
+		return true
+	}
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	return false
 }
 
 func (l *Leader) sendJSON(w http.ResponseWriter, status int, body RPCResponse) {
