@@ -1098,10 +1098,22 @@ const handleRequest = async (request) => {
         if (!category) category = await figma.annotations.addAnnotationCategoryAsync({ label: "QA", color: "red" });
         // Idempotent: replace this tool's previous QA note, keep every other annotation.
         const existing = Array.isArray(node.annotations) ? node.annotations.slice() : [];
-        const kept = existing.filter(
-          (annotation) =>
-            !(annotation && typeof annotation.labelMarkdown === "string" && annotation.labelMarkdown.startsWith(QA_ANNOTATION_PREFIX))
-        );
+        const kept = existing
+          .filter(
+            (annotation) =>
+              !(annotation && typeof annotation.labelMarkdown === "string" && annotation.labelMarkdown.startsWith(QA_ANNOTATION_PREFIX))
+          )
+          // Figma normalizes annotations on READ (label + labelMarkdown both set);
+          // writing that back fails "only one of label or labelMarkdown". Rebuild
+          // each kept annotation with exactly one of the two.
+          .map((annotation) => {
+            if (!annotation) return annotation;
+            const out = { categoryId: annotation.categoryId };
+            if (typeof annotation.labelMarkdown === "string" && annotation.labelMarkdown) out.labelMarkdown = annotation.labelMarkdown;
+            else if (typeof annotation.label === "string" && annotation.label) out.label = annotation.label;
+            if (Array.isArray(annotation.properties)) out.properties = annotation.properties;
+            return out;
+          });
         node.annotations = kept.concat([{ categoryId: category.id, labelMarkdown: `**QA · ${severity}** — ${params.message}` }]);
         return {
           type: request.type,
