@@ -42,21 +42,32 @@ type reviewPageInfo struct {
 	Frames   []reviewFrameInfo `json:"frames"`
 }
 
-// autoScale picks an export scale from the frame WIDTH only — height is handled
-// by tiling, never by shrinking (a shrunken tall page is unreadable).
+// autoScale picks an export scale from the frame WIDTH — height is handled by
+// tiling, not by shrinking — but caps total rendered pixels: software-rendered
+// exports of huge frames (1440×12000 at 1x ≈ 17M px) blow past every timeout.
+const maxRenderPixels = 9_000_000
+
 func autoScale(w, h float64) float64 {
+	s := 1.0
 	switch {
 	case w < 800:
-		return 2
+		s = 2
 	case w <= 2400:
-		return 1
+		s = 1
 	default:
-		s := 1600 / w
+		s = 1600 / w
 		if s < 0.25 {
 			s = 0.25
 		}
-		return s
 	}
+	if w*h*s > maxRenderPixels {
+		s2 := maxRenderPixels / (w * h)
+		if s2 < 0.25 {
+			s2 = 0.25
+		}
+		s = s2
+	}
+	return s
 }
 
 func sanitizeName(s string) string {

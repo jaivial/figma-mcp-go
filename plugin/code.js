@@ -417,6 +417,9 @@ const handleRequest = async (request) => {
               : format === "PDF" ? { format: "PDF" }
               : format === "JPG" ? { format: "JPG", constraint: { type: "SCALE", value: scale } }
               : { format: "PNG", constraint: { type: "SCALE", value: scale } };
+            // Software rendering a big frame can exceed the bridge's 30 s request
+            // timeout; a progress ping before each export widens it to 60 s.
+            figma.ui.postMessage({ type: "progress_update", requestId: request.requestId, progress: 50, message: "rendering " + node.name });
             const bytes = await node.exportAsync(settings);
             const base64 = figma.base64Encode(bytes);
             return { nodeId: node.id, nodeName: node.name, format, base64, width: node.width, height: node.height };
