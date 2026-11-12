@@ -97,6 +97,8 @@ Watch the video:
 |------|-------------|
 | `get_screenshot` | Base64 image export of any node |
 | `save_screenshots` | Export images to disk (server-side, no API call) |
+| `capture_review` | Screenshot + layout context + text inventory + review checklist in one call |
+| `export_visual_review` | EVERY frame of EVERY page as tiled, legible review images + manifest in one call |
 
 ### Writing & layout
 
